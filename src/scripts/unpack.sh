@@ -1,5 +1,5 @@
 # Unpack DG-Miner data tsv file (tab-separated values)
-gzip -d DG-Miner_miner-disease-gene.tsv.gz
+gzip -d src/data/DG-Miner/DG-Miner_miner-disease-gene.tsv.gz
 
 # Create directories
 mkdir -p src
