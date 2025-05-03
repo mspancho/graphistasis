@@ -77,17 +77,25 @@ def visualize_graph(data: Data):
 
 
 def main():
-    # Test schema extraction
-    schema = get_tsv_schema()
-    print("Schema of the DGMiner TSV file:")
-    print(schema)
+    data_present = input("Have you downloaded the data file locally? If so, type 'yes' or 'y'.\n")# Test schema extraction
+    
+    disease_name = 'schizophrenia'
+    disease_id = 'D012559'
 
-    # Test disease selection
-    disease_df = disease_selection('schizophrenia', 'D012559')
-    print("\nSelected Disease DataFrame:")
-    print(disease_df.head())
-    print("\nFiltered Disease DataFrame:")
-    print(disease_df.head())
+    if data_present.lower() in ['yes', 'y']:
+        print("Proceeding with schema extraction...")
+        schema = get_tsv_schema()
+        print("Schema of the DGMiner TSV file:")
+        print(schema)
+
+        # Test disease selection
+        disease_df = disease_selection(disease_name, disease_id)
+        print("\nSelected Disease DataFrame:")
+        print(disease_df.head())
+        print("Saving DataFrame to TSV...")
+        disease_df.to_csv(f'src/data/DG-miner-tsv/{disease_name}_{disease_id}.tsv', sep='\t', index=False)
+    else:
+        disease_df = pd.read_csv(f'src/data/DG-miner-tsv/{disease_name}_{disease_id}.tsv', sep='\t')
 
     # Test graph construction
     graph_data = graph_construction(disease_df)
@@ -95,6 +103,7 @@ def main():
     print(graph_data)
 
     # Visualize graph w/ NetworkX
+    print("Visualizing the graph...")
     visualize_graph(graph_data)
 
 if __name__ == "__main__":
