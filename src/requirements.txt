@@ -1,0 +1,11 @@
+torch>=2.0.0  # PyTorch with MPS (Apple GPU) support
+torch_geometric>=2.3.0  # GNN framework
+pyg-lib>=0.2.0  # Backend for PyTorch Geometric
+torch-scatter>=2.1.0  # PyG req
+torch-sparse>=0.6.16  # PyG req
+pandas>=2.0.0  # TSV preprocessing
+numpy>=1.24.0
+matplotlib>=3.7.0  # Plotting
+seaborn>=0.12.2  # Better vis
+scikit-learn>=1.2.0  # Metrics (AUC-ROC, accuracy)
+tqdm>=4.65.0  # Training progress bars
