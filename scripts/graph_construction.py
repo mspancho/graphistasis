@@ -9,7 +9,7 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 
-def get_tsv_schema(file_path="src/data/DG-Miner-tsv/mine-disease-gene.tsv") -> pd.DataFrame:
+def get_tsv_schema(file_path="data/mine-disease-gene.tsv") -> pd.DataFrame:
     """
     Import the DGMiner TSV file into a pandas DataFrame and return its schema.
     """
@@ -25,7 +25,7 @@ def get_tsv_schema(file_path="src/data/DG-Miner-tsv/mine-disease-gene.tsv") -> p
 
 def disease_selection(dn: str, 
                       did: str, 
-                      file_path="src/data/DG-Miner-tsv/mine-disease-gene.tsv") -> pd.DataFrame:
+                      file_path="data/mine-disease-gene.tsv") -> pd.DataFrame:
     """
     Import the DGMiner TSV file into a pandas DataFrame.
     """
@@ -93,9 +93,9 @@ def main():
         print("\nSelected Disease DataFrame:")
         print(disease_df.head())
         print("Saving DataFrame to TSV...")
-        disease_df.to_csv(f'src/data/DG-miner-tsv/{disease_name}_{disease_id}.tsv', sep='\t', index=False)
+        disease_df.to_csv(f'data/{disease_name}_{disease_id}.tsv', sep='\t', index=False)
     else:
-        disease_df = pd.read_csv(f'src/data/DG-miner-tsv/{disease_name}_{disease_id}.tsv', sep='\t')
+        disease_df = pd.read_csv(f'data/{disease_name}_{disease_id}.tsv', sep='\t')
 
     # Test graph construction
     graph_data = graph_construction(disease_df)
