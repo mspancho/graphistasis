@@ -1,13 +1,10 @@
-# Unpack DG-Miner data tsv file (tab-separated values)
-gzip -d data/DG-Miner_miner-disease-gene.tsv.gz
-
 # Create directories
-mkdir -p data/
-mkdir -p models
+mkdir -p data
 mkdir -p figures
-mkdir -p scripts
+mkdir -p models
 
-# Move files to appropriate directories
-mv unpack.sh scripts/unpack.sh
-mv DG-Miner_miner-disease-gene.tsv data/mine-disease-gene.tsv
-mv graph_construction.py scripts/graph_construction.py
+# Download the dataset
+wget -P data https://snap.stanford.edu/biodata/datasets/10020/files/DG-Miner_miner-disease-gene.tsv.gz
+
+# Unzip the dataset
+gzip -d data/DG-Miner_miner-disease-gene.tsv.gz
