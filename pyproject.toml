@@ -5,12 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "biopython>=1.85",
     "geometric>=1.1",
     "ipykernel>=6.29.5",
     "matplotlib>=3.10.1",
     "numpy>=2.2.5",
     "pandas>=2.2.3",
     "pip>=25.1.1",
+    "pymedtermino>=0.3.3",
     "scikit-learn>=1.6.1",
     "seaborn>=0.13.2",
     "torch>=2.7.0",
