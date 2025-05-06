@@ -318,30 +318,6 @@ def generate_graph_from_tsv(tsv_path):
 
     return G
 
-def generate_graph_from_tsvs(tsv_paths):
-    """
-    Generate a graph from multiple TSV files where each line represents an edge between two nodes.
-
-    Args:
-        tsv_paths (list): List of paths to the TSV files.
-
-    Returns:
-        nx.Graph: A NetworkX graph object.
-    """
-    # Create an empty graph
-    G = nx.Graph()
-
-    # Iterate through each TSV file
-    for tsv_path in tsv_paths:
-        # Read the TSV file into a DataFrame
-        df = pd.read_csv(tsv_path, sep="\t", header=0)  # Skip the header row
-
-        # Add edges to the graph
-        for _, row in df.iterrows():
-            G.add_edge(row[0], row[1])
-
-    return G
-
 def plot_graph(G, title="Graph", save_path=None):
     """
     Plot a NetworkX graph.
@@ -361,3 +337,41 @@ def plot_graph(G, title="Graph", save_path=None):
         print(f"Graph saved to {save_path}")
 
     plt.show()
+
+def save_graph(graph, file_path):
+    """
+    Save a NetworkX graph to a GML file.
+
+    Args:
+        graph (nx.Graph): The graph to save.
+        file_path (str): The path to save the GML file.
+    """
+    nx.write_gml(graph, file_path)
+    print(f"Graph saved to {file_path}")
+
+def combine_graphs(graph1, graph2):
+    """
+    Combine two NetworkX graphs into one.
+
+    Args:
+        graph1 (nx.Graph): The first graph.
+        graph2 (nx.Graph): The second graph.
+
+    Returns:
+        nx.Graph: The combined graph.
+    """
+    combined_graph = nx.compose(graph1, graph2)
+    return combined_graph
+
+def load_graph(file_path):
+    """
+    Load a NetworkX graph from a GML file.
+
+    Args:
+        file_path (str): The path to the GML file.
+
+    Returns:
+        nx.Graph: The loaded graph.
+    """
+    graph = nx.read_gml(file_path)
+    return graph
