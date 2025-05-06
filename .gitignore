@@ -2,3 +2,4 @@
 .venv/
 data/
 scripts/__pycache__/
+graphs/
