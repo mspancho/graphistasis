@@ -296,7 +296,7 @@ def generate_epistatic_interactions_tsv(interactions, gene_list, output_path):
     
     return interaction_df
 
-def generate_graph_from_tsv(tsv_path):
+def generate_graph_from_tsv(tsv_path: str, tsv_type: str) -> nx.Graph:
     """
     Generate a graph from a TSV file where each line represents an edge between two nodes.
 
@@ -313,8 +313,20 @@ def generate_graph_from_tsv(tsv_path):
     G = nx.Graph()
 
     # Add edges to the graph
-    for _, row in df.iterrows():
-        G.add_edge(row[0], row[1])
+    if tsv_type == "DG":
+        for _, row in df.iterrows():
+            disease = row[0]
+            gene = row[1]
+            G.add_node(disease, type='disease')
+            G.add_node(gene, type='gene')
+            G.add_edge(disease, gene)
+    elif tsv_type == "GG":
+        for _, row in df.iterrows():
+            gene1 = row[0]
+            gene2 = row[1]
+            G.add_node(gene1, type='gene')
+            G.add_node(gene2, type='gene')
+            G.add_edge(gene1, gene2)
 
     return G
 
@@ -329,6 +341,9 @@ def plot_graph(G, title="Graph", save_path=None):
     """
     plt.figure(figsize=(20, 20))
     pos = nx.spring_layout(G)
+    ## Color code
+    # colors = ['blue' if G.nodes[n].get('node_type') == 'gene' else 'red' for n in G.nodes()]
+    # nx.draw(G, pos, with_labels=True, node_size=50, node_color=colors, font_size=8)
     nx.draw(G, pos, with_labels=True, node_size=50, node_color='blue', font_size=8)
     plt.title(title)
     
