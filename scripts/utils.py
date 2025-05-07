@@ -317,15 +317,15 @@ def generate_graph_from_tsv(tsv_path: str, tsv_type: str) -> nx.Graph:
         for _, row in df.iterrows():
             disease = row[0]
             gene = row[1]
-            G.add_node(disease, type='disease')
-            G.add_node(gene, type='gene')
+            G.add_node(disease, node_type='disease', name=disease)
+            G.add_node(gene, node_type='gene', name=gene)
             G.add_edge(disease, gene)
     elif tsv_type == "GG":
         for _, row in df.iterrows():
             gene1 = row[0]
             gene2 = row[1]
-            G.add_node(gene1, type='gene')
-            G.add_node(gene2, type='gene')
+            G.add_node(gene1, node_type='gene', name=gene1)
+            G.add_node(gene2, node_type='gene', name=gene2)
             G.add_edge(gene1, gene2)
 
     return G

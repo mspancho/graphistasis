@@ -2,6 +2,7 @@ import torch_geometric as pyg
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 from torch_geometric.explain.algorithm import GNNExplainer
 from torch_geometric.data import Data
+from torch_geometric.loader import NeighborLoader
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -77,24 +78,26 @@ def prepare_data(graph: nx.Graph) -> Data:
     Prepare the data for GNN link prediction.
     Returns a PyTorch Geometric Data object.
     """
+
     graph = nx.convert_node_labels_to_integers(graph)
     pyg_data = pyg.utils.from_networkx(graph)
 
-    # NOTE: One-hot encoding creates feature matrix too large for such a large graph
-    # pyg_data.x = torch.eye(nx.number_of_nodes())
-    # Build node_type list and idx_to_gene mapping
     node_type_list = []
     idx_to_gene = {}
+    idx_to_disease = {}
     for idx, (n, d) in enumerate(graph.nodes(data=True)):
         node_type = d.get('node_type', None) or d.get('type', None)
         node_type_list.append(node_type)
         if node_type == 'gene':
-            idx_to_gene[idx] = str(n)
+            idx_to_gene[idx] = d.get('name', str(n))
+        if node_type == 'disease':
+            idx_to_disease[idx] = d.get('name', str(n))
     pyg_data.node_type_list = node_type_list
     pyg_data.idx_to_gene = idx_to_gene
+    pyg_data.idx_to_disease = idx_to_disease
 
     # Use degree as a feature (recommended for large graphs)
-    degrees = torch.tensor([val for (node, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
+    degrees = torch.tensor([val for (_, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
     pyg_data.x = degrees
     print("After setting degrees, x shape:", pyg_data.x.shape)
 
@@ -110,6 +113,12 @@ def prepare_data(graph: nx.Graph) -> Data:
         print("Error in prepare_data print statements:", e)
 
     return pyg_data
+
+def get_gene_indices(data):
+    return [i for i, t in enumerate(data.node_type_list) if t == 'gene']
+
+def get_disease_indices(data):
+    return [i for i, t in enumerate(data.node_type_list) if t == 'disease']
 
 def get_gene_gene_edges(data):
     """
@@ -127,7 +136,69 @@ def get_gene_gene_edges(data):
         raise ValueError("No gene-gene edges found in the graph.")
     return data.edge_index[:, mask]
 
-def train_link_prediction(model, data, optimizer, criterion, epochs=100):
+def mini_batch_train_link_prediction(model: GraphiStasis, data: Data, optimizer, criterion, epochs=10, batch_size=1024, num_neighbors=[10, 10]):
+    model.train()
+    losses = []
+    gene_indices = list(data.idx_to_gene.keys())
+    disease_indices = set(data.idx_to_disease.keys())
+
+    loader = NeighborLoader(
+        data.cpu(),
+        input_nodes=gene_indices,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in tqdm.tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            # Ensure at least one disease node in the batch
+            batch_disease = [i for i in batch.n_id.tolist() if i in disease_indices]
+            if not batch_disease:
+                continue  # Skip this batch
+
+            batch = batch.to(next(model.parameters()).device)
+            z = model(batch.x, batch.edge_index)
+
+            # Get gene-gene edges in the batch
+            mask = []
+            for i in range(batch.edge_index.shape[1]):
+                src, dst = batch.edge_index[0, i].item(), batch.edge_index[1, i].item()
+                if batch.node_type_list[src] == 'gene' and batch.node_type_list[dst] == 'gene':
+                    mask.append(i)
+            if not mask:
+                continue
+            pos_edge_index = batch.edge_index[:, mask]
+            pos_scores = model.decode(z, pos_edge_index)
+
+            # Negative sampling within the batch
+            batch_gene_indices = [i for i, t in enumerate(batch.node_type_list) if t == 'gene']
+            all_gene_pairs = set(itertools.combinations(batch_gene_indices, 2))
+            existing_gene_edges = set(tuple(sorted((pos_edge_index[0, i].item(), pos_edge_index[1, i].item()))) for i in range(pos_edge_index.shape[1]))
+            neg_pairs = list(all_gene_pairs - existing_gene_edges)
+            np.random.shuffle(neg_pairs)
+            neg_pairs = neg_pairs[:pos_edge_index.shape[1]]
+            if not neg_pairs:
+                continue
+            neg_edge_index = torch.tensor(neg_pairs, dtype=torch.long).t().contiguous()
+            neg_scores = model.decode(z, neg_edge_index)
+
+            scores = torch.cat([pos_scores, neg_scores])
+            labels = torch.cat([
+                torch.ones(pos_scores.size(0), device=scores.device),
+                torch.zeros(neg_scores.size(0), device=scores.device)
+            ])
+
+            loss = criterion(scores, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        losses.append(total_loss)
+        print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+    return losses
+
+# def train_link_prediction(model, data, optimizer, criterion, epochs=100):
     """
     Train the GraphiStasis GNN model for link prediction.
     """
@@ -173,7 +244,7 @@ def train_link_prediction(model, data, optimizer, criterion, epochs=100):
 
     return losses
 
-def test_link_prediction(model, data, test_epochs=1):
+# def test_link_prediction(model, data, test_epochs=1):
     """
     Evaluate the GraphiStasis GNN model for link prediction.
     Returns ROC AUC and average precision.
@@ -213,7 +284,87 @@ def test_link_prediction(model, data, test_epochs=1):
 
     return {'roc_auc': roc_auc, 'avg_precision': avg_precision}
 
-def predict_gene_gene_links(model, data, threshold=0.5, topk=None):
+def test_link_prediction(model: GraphiStasis, data: Data, batch_size=1024, num_neighbors=[10, 10], test_epochs=1):
+    """
+    Evaluate the GraphiStasis GNN model for link prediction using mini-batch inference.
+    Returns ROC AUC and average precision.
+    """
+    from torch_geometric.loader import NeighborLoader
+    from sklearn.metrics import roc_auc_score, precision_recall_curve
+    import tqdm
+
+    model.eval()
+    results = []
+    gene_indices = list(data.idx_to_gene.keys())
+    disease_indices = set(data.idx_to_disease.keys())
+
+    loader = NeighborLoader(
+        data.cpu(),
+        input_nodes=gene_indices,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    all_y_true = []
+    all_y_scores = []
+
+    with torch.no_grad():
+        for _ in range(test_epochs):
+            for batch in tqdm.tqdm(loader, desc="Testing"):
+                # Ensure at least one disease node in the batch
+                batch_disease = [i for i in batch.n_id.tolist() if i in disease_indices]
+                if not batch_disease:
+                    continue
+
+                batch = batch.to(next(model.parameters()).device)
+                z = model(batch.x, batch.edge_index)
+
+                # Get gene-gene edges in the batch
+                mask = []
+                for i in range(batch.edge_index.shape[1]):
+                    src, dst = batch.edge_index[0, i].item(), batch.edge_index[1, i].item()
+                    if batch.node_type_list[src] == 'gene' and batch.node_type_list[dst] == 'gene':
+                        mask.append(i)
+                if not mask:
+                    continue
+                pos_edge_index = batch.edge_index[:, mask]
+                pos_scores = torch.sigmoid(model.decode(z, pos_edge_index))
+
+                # Negative sampling within the batch
+                batch_gene_indices = [i for i, t in enumerate(batch.node_type_list) if t == 'gene']
+                all_gene_pairs = set(itertools.combinations(batch_gene_indices, 2))
+                existing_gene_edges = set(tuple(sorted((pos_edge_index[0, i].item(), pos_edge_index[1, i].item()))) for i in range(pos_edge_index.shape[1]))
+                neg_pairs = list(all_gene_pairs - existing_gene_edges)
+                np.random.shuffle(neg_pairs)
+                neg_pairs = neg_pairs[:pos_edge_index.shape[1]]
+                if not neg_pairs:
+                    continue
+                neg_edge_index = torch.tensor(neg_pairs, dtype=torch.long).t().contiguous()
+                neg_scores = torch.sigmoid(model.decode(z, neg_edge_index))
+
+                y_true = torch.cat([
+                    torch.ones(pos_scores.size(0), device=pos_scores.device),
+                    torch.zeros(neg_scores.size(0), device=neg_scores.device)
+                ])
+                y_scores = torch.cat([pos_scores, neg_scores])
+
+                all_y_true.append(y_true.cpu())
+                all_y_scores.append(y_scores.cpu())
+
+    if not all_y_true:
+        raise ValueError("No valid batches for evaluation.")
+
+    all_y_true = torch.cat(all_y_true).numpy()
+    all_y_scores = torch.cat(all_y_scores).numpy()
+
+    roc_auc = roc_auc_score(all_y_true, all_y_scores)
+    precision, recall, _ = precision_recall_curve(all_y_true, all_y_scores)
+    avg_precision = np.trapz(precision, recall)
+
+    return {'roc_auc': roc_auc, 'avg_precision': avg_precision}
+
+def predict_gene_gene_links(model: GraphiStasis, data, threshold=0.5, topk=None):
     """
     Predict gene-gene interactions only.
     Returns a list of (gene1_name, gene2_name, score) tuples above the threshold or topk highest.
