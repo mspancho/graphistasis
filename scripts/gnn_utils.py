@@ -129,18 +129,31 @@ def prepare_data(graph: nx.Graph) -> Data:
     if hasattr(pyg_data, 'name'): del pyg_data.name
 
     if not hasattr(pyg_data, 'name'): print("Name removed from pyg_data")
+    print(pyg_data)
     transform = RandomLinkSplit(is_undirected=True)
     train_data, val_data, test_data = transform(pyg_data)
 
     return train_data, val_data, test_data, [node_type_list, idx_to_gene, idx_to_disease]
 
+def compute_binary_accuracy(y_pred_logits, y_true):
+    """
+    Compute binary accuracy given logits and true labels.
+    """
+    y_pred = torch.sigmoid(y_pred_logits) > 0.5
+    if isinstance(y_true, torch.Tensor):
+        y_true = y_true.bool()
+    else:
+        y_true = torch.tensor(y_true).bool()
+    return (y_pred.cpu() == y_true.cpu()).float().mean().item()
+
 def train_one_epoch(model: GraphiStasis,
                     train_data: Data, # Full training data
                     optimizer: optim.Adam,
                     criterion: nn.Module,
-                    device: torch.device) -> float:
+                    device: torch.device) -> tuple:
     """
     Trains the model for one epoch on the full training graph.
+    Returns (loss, accuracy).
     """
     model.train()
     optimizer.zero_grad()
@@ -162,8 +175,9 @@ def train_one_epoch(model: GraphiStasis,
     loss = criterion(pred_scores, edge_label)
     loss.backward()
     optimizer.step()
-    
-    return loss.item()
+
+    acc = compute_binary_accuracy(pred_scores, edge_label)
+    return loss.item(), acc
 
 
 @torch.no_grad()
@@ -178,6 +192,7 @@ def evaluate_link_predictor(model: GraphiStasis,
     Evaluates the model on a given data split (validation or test).
     Uses the training graph structure for generating node embeddings.
     Includes a progress bar for link decoding.
+    Returns dict with ROC AUC, avg precision, accuracy, y_true, y_scores.
     """
     model.eval()
 
@@ -190,6 +205,7 @@ def evaluate_link_predictor(model: GraphiStasis,
     
     y_scores_list = []
     y_true_list = []
+    y_logits_list = []
 
     num_links_to_eval = data_split.edge_label_index.shape[1]
     
@@ -208,14 +224,17 @@ def evaluate_link_predictor(model: GraphiStasis,
         
         y_scores_list.append(batch_pred_scores_sigmoid.cpu())
         y_true_list.append(batch_edge_label.cpu())
+        y_logits_list.append(batch_pred_scores_logits.cpu())
 
     if not y_true_list: # No links were evaluated
         print(f"Warning: No links evaluated in {desc}. Returning default metrics.")
-        return {'roc_auc': 0.0, 'avg_precision': 0.0}
+        return {'roc_auc': 0.0, 'avg_precision': 0.0, 'accuracy': 0.0, 'y_true': [], 'y_scores': []}
 
     # Concatenate all batches
     true_labels = torch.cat(y_true_list).numpy()
     pred_scores_np = torch.cat(y_scores_list).numpy()
+    pred_logits = torch.cat(y_logits_list)
+    acc = compute_binary_accuracy(pred_logits, torch.cat(y_true_list))
 
     # Check if true_labels contains only one class
     if len(np.unique(true_labels)) < 2:
@@ -231,6 +250,7 @@ def evaluate_link_predictor(model: GraphiStasis,
     return {
         'roc_auc': roc_auc,
         'avg_precision': avg_precision,
+        'accuracy': acc,
         'y_true': true_labels,
         'y_scores': pred_scores_np
     }
@@ -271,7 +291,13 @@ def run_training_pipeline(
     # Initialize early stopping variables
     best_val_metric = 0.0
     epochs_no_improve = 0
-    history = {'train_loss': [], 'val_roc_auc': [], 'val_avg_precision': []}
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_roc_auc': [],
+        'val_avg_precision': [],
+        'val_acc': []
+    }
 
     # edge_index for message passing during eval should be from training graph
     # train_data.edge_index as returned by RandomLinkSplit
@@ -282,17 +308,19 @@ def run_training_pipeline(
     for epoch in tqdm.tqdm(range(1, epochs + 1), desc="Overall Epochs"):
         # Pass the full train_data to train_one_epoch
         # train_data moved to device inside train_one_epoch
-        avg_train_loss = train_one_epoch(model, train_data, optimizer, criterion, device)
+        avg_train_loss, avg_train_acc = train_one_epoch(model, train_data, optimizer, criterion, device)
         history['train_loss'].append(avg_train_loss)
+        history['train_acc'].append(avg_train_acc)
         
         # val_data components moved to device inside evaluate_link_predictor
         val_metrics = evaluate_link_predictor(model, val_data, train_graph_message_passing_edges_eval, device, desc="Validating", eval_batch_size=eval_batch_size)
         history['val_roc_auc'].append(val_metrics['roc_auc'])
         history['val_avg_precision'].append(val_metrics['avg_precision'])
+        history['val_acc'].append(val_metrics['accuracy'])
 
         # Print epoch summary
-        print(f"\nEpoch {epoch:03d} Summary: Train Loss: {avg_train_loss:.4f}, "
-              f"Val ROC AUC: {val_metrics['roc_auc']:.4f}, Val Avg Precision: {val_metrics['avg_precision']:.4f}")
+        print(f"\nEpoch {epoch:03d} Summary: Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f}, "
+              f"Val ROC AUC: {val_metrics['roc_auc']:.4f}, Val Avg Precision: {val_metrics['avg_precision']:.4f}, Val Acc: {val_metrics['accuracy']:.4f}")
 
         # Early stopping check
         current_val_metric = val_metrics['roc_auc'] 
@@ -315,7 +343,7 @@ def run_training_pipeline(
     print("\nStarting final testing...")
     # test_data components moved to device inside evaluate_link_predictor
     test_metrics = evaluate_link_predictor(model, test_data, train_graph_message_passing_edges_eval, device, desc="Testing", eval_batch_size=eval_batch_size)
-    print(f"\nFinal Test Metrics: ROC AUC: {test_metrics['roc_auc']:.4f}, Avg Precision: {test_metrics['avg_precision']:.4f}")
+    print(f"\nFinal Test Metrics: ROC AUC: {test_metrics['roc_auc']:.4f}, Avg Precision: {test_metrics['avg_precision']:.4f}, Accuracy: {test_metrics['accuracy']:.4f}")
 
     return model, history, test_metrics
 
@@ -329,6 +357,51 @@ def visualize_loss(history, title="Loss Curve", xlabel="Epochs", ylabel="Loss", 
     plt.plot(history['train_loss'], label='Train Loss', color='blue')
     if 'val_roc_auc' in history:
         plt.plot(history['val_roc_auc'], label='Val ROC AUC', color='orange')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.show()
+
+def plot_training_accuracy_curve(history, title="Training Accuracy Curve", xlabel="Epochs", ylabel="Accuracy", save_path=None):
+    """
+    Plot the training accuracy per epoch.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_acc'], label='Train Accuracy', color='green')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.show()
+
+def plot_loss_curve(history, title="Loss Curve", xlabel="Epochs", ylabel="Loss", save_path=None):
+    """
+    Plot the training loss per epoch.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_loss'], label='Train Loss', color='blue')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.show()
+
+def plot_val_roc_auc_curve(history, title="Validation ROC AUC Curve", xlabel="Epochs", ylabel="ROC AUC", save_path=None):
+    """
+    Plot the validation ROC AUC per epoch.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['val_roc_auc'], label='Val ROC AUC', color='orange')
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
