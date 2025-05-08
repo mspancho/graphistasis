@@ -302,6 +302,7 @@ def generate_graph_from_tsv(tsv_path: str, tsv_type: str) -> nx.Graph:
 
     Args:
         tsv_path (str): Path to the TSV file.
+        tsv_type (str): Type of the TSV file. Can be "DG" for disease-gene or "GG" for gene-gene.
 
     Returns:
         nx.Graph: A NetworkX graph object.

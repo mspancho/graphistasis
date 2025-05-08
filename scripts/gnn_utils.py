@@ -22,6 +22,7 @@ from sklearn.metrics import precision_score
 import networkx as nx
 import tqdm
 import itertools
+import pickle
 
 class GraphiStasis(nn.Module):
     """
@@ -79,24 +80,36 @@ def prepare_data(graph: nx.Graph) -> Data:
     Returns a PyTorch Geometric Data object.
     """
 
+    # Load the pickle file (read-binary mode)
+    with open("genept/GenePT_gene_embedding_ada_text.pickle", "rb") as f:
+        gene_embedding_dict = pickle.load(f)
+
     graph = nx.convert_node_labels_to_integers(graph)
     pyg_data = pyg.utils.from_networkx(graph)
 
     node_type_list = []
     idx_to_gene = {}
     idx_to_disease = {}
+    embedding_dim = len(next(iter(gene_embedding_dict.values())))
+    embeddings = []
     for idx, (n, d) in enumerate(graph.nodes(data=True)):
         node_type = d.get('node_type', None) or d.get('type', None)
         node_type_list.append(node_type)
+        node_name = d.get('name', str(n))
         if node_type == 1:
-            idx_to_gene[idx] = d.get('name', str(n))
+            idx_to_gene[idx] = node_name
+            emb = gene_embedding_dict.get(node_name, np.zeros(embedding_dim))
         if node_type == 2:
-            idx_to_disease[idx] = d.get('name', str(n))
+            idx_to_disease[idx] = node_name
+            emb = np.zeros(embedding_dim)
+        embeddings.append(emb)
     print("Idx -> [Gene, Disease] mapping done")
+    pyg_data.x = torch.tensor(np.stack(embeddings), dtype=torch.float32)
+    print("After setting embeddings, x shape:", pyg_data.x.shape)
 
     # Use degree as a feature (recommended for large graphs)
-    degrees = torch.tensor([val for (_, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
-    pyg_data.x = degrees
+    # degrees = torch.tensor([val for (_, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
+    # pyg_data.x = degrees
     print("After setting degrees, x shape:", pyg_data.x.shape)
 
     # Debug prints
@@ -244,16 +257,17 @@ def run_training_pipeline(
     train_data: Data, # From RandomLinkSplit
     val_data: Data,   # From RandomLinkSplit
     test_data: Data,  # From RandomLinkSplit
-    epochs: int = 5,
+    epochs: int = 50,
     # batch_size and num_neighbors_loader are removed as we are doing full-graph training
     learning_rate: float = 0.01,
-    early_stopping_patience: int = 2, # Set to None to disable
+    early_stopping_patience: int = 10, # Set to None to disable
     eval_batch_size: int = 2048 # Batch size for evaluate_link_predictor
     ) -> tuple:
     """
     Main pipeline to train, validate, and test the GNN link predictor using full-graph training.
     """
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    device = torch.device('cpu')
     print(f"Using device: {device}")
 
     if 'in_channels' not in model_args and hasattr(train_data, 'num_node_features'):
@@ -322,66 +336,97 @@ def run_training_pipeline(
 
     return model, history, test_metrics
 
-def visualize_loss(losses, title="Loss Curve", xlabel="Epochs", ylabel="Loss"):
+def visualize_loss(history, title="Loss Curve", xlabel="Epochs", ylabel="Loss", save_path=None):
     """
     Visualize the training loss over epochs.
+    Accepts the 'history' dict returned by run_training_pipeline.
+    If save_path is provided, saves the plot to that file.
     """
     plt.figure(figsize=(10, 5))
-    plt.plot(losses, label='Loss', color='blue')
+    plt.plot(history['train_loss'], label='Train Loss', color='blue')
+    if 'val_roc_auc' in history:
+        plt.plot(history['val_roc_auc'], label='Val ROC AUC', color='orange')
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.legend()
     plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
     plt.show()
 
-def predict_gene_gene_links(model: GraphiStasis, data, threshold=0.5, topk=None):
+def predict_gene_gene_links(model: GraphiStasis, data, node_type_list, idx_to_gene, threshold=0.5, topk=None, device='cpu', save_path=None):
     """
     Predict gene-gene interactions only.
     Returns a list of (gene1_name, gene2_name, score) tuples above the threshold or topk highest.
+    If save_path is provided, saves a histogram of the top scores to that file.
     """
     model.eval()
-    gene_indices = [i for i, t in enumerate(data.node_type_list) if t == 'gene']
-    idx_to_gene = getattr(data, 'idx_to_gene', None)
+    gene_indices = [i for i, t in enumerate(node_type_list) if t == 1]
     pairs = list(itertools.combinations(gene_indices, 2))
-    edge_index = torch.tensor(pairs, dtype=torch.long).t().contiguous()
+    if not pairs:
+        return []
+    edge_index = torch.tensor(pairs, dtype=torch.long).t().contiguous().to(device)
 
     with torch.no_grad():
-        z = model(data.x, data.edge_index)
+        z = model(data.x.to(device), data.edge_index.to(device))
         scores = torch.sigmoid(model.decode(z, edge_index))
 
         # Filter by threshold or topk
         if topk is not None:
             top_scores, top_idx = torch.topk(scores, topk)
-            selected = [(edge_index[0, i].item(), edge_index[1, i].item(), top_scores[i].item()) for i in top_idx]
+            selected = [(edge_index[0, i].item(), edge_index[1, i].item(), top_scores[i].item()) for i in range(topk)]
+            plot_scores = top_scores.cpu().numpy()
         else:
             mask = scores > threshold
             selected = [(edge_index[0, i].item(), edge_index[1, i].item(), scores[i].item()) for i in mask.nonzero(as_tuple=False).flatten()]
+            plot_scores = scores[mask].cpu().numpy()
 
         # Map indices to gene names if available
         if idx_to_gene:
             selected = [(idx_to_gene.get(i, i), idx_to_gene.get(j, j), score) for i, j, score in selected]
 
+        # Optionally save a histogram of the predicted scores
+        if save_path and len(plot_scores) > 0:
+            plt.figure()
+            plt.hist(plot_scores, bins=20, color='skyblue')
+            plt.title("Predicted Gene-Gene Link Scores")
+            plt.xlabel("Score")
+            plt.ylabel("Count")
+            plt.grid()
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close()
+
     return selected
 
-def plot_roc_curve_link(y_true, y_scores):
+def plot_roc_curve_link(y_true, y_scores, title='ROC Curve (Link Prediction)', save_path=None):
     """
     Plot the ROC curve for link prediction.
+    If save_path is provided, saves the plot to that file.
     """
     fpr, tpr, _ = roc_curve(y_true, y_scores)
+    plt.figure()
     plt.plot(fpr, tpr, marker='.')
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve (Link Prediction)')
+    plt.title(title)
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
     plt.show()
 
-def plot_precision_recall_link(y_true, y_scores):
+def plot_precision_recall_link(y_true, y_scores, title='Precision-Recall Curve (Link Prediction)', save_path=None):
     """
     Plot the precision-recall curve for link prediction.
+    If save_path is provided, saves the plot to that file.
     """
     precision, recall, _ = precision_recall_curve(y_true, y_scores)
+    plt.figure()
     plt.plot(recall, precision, marker='.')
     plt.xlabel('Recall')
     plt.ylabel('Precision')
-    plt.title('Precision-Recall Curve (Link Prediction)')
+    plt.title(title)
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
     plt.show()
