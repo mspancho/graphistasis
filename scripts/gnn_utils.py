@@ -118,7 +118,7 @@ def prepare_data(graph: nx.Graph) -> Data:
     if hasattr(pyg_data, 'name'): del pyg_data.name
 
     if not hasattr(pyg_data, 'name'): print("Name removed from pyg_data")
-    transform = RandomLinkSplit(is_undirected=True, split_labels=True)
+    transform = RandomLinkSplit(is_undirected=True)
     train_data, val_data, test_data = transform(pyg_data)
 
     return train_data, val_data, test_data, [node_type_list, idx_to_gene, idx_to_disease]
@@ -144,282 +144,183 @@ def prepare_data(graph: nx.Graph) -> Data:
 #         raise ValueError("No gene-gene edges found in the graph.")
 #     return data.edge_index[:, mask]
 
-def mini_batch_train_link_prediction(model: GraphiStasis,
-                                     data: Data,
-                                     optimizer: optim.Adam,
-                                     criterion: nn.BCELoss,
-                                     properties: list,
-                                     epochs: int=10,
-                                     batch_size: int=1024,
-                                     num_neighbors: list=[10, 10],
-                                     ) -> list:
+def train_one_epoch(model: GraphiStasis,
+                    train_data: Data, # Full training data
+                    optimizer: optim.Adam,
+                    criterion: nn.Module,
+                    device: torch.device) -> float:
     """
-    Train the GraphiStasis GNN model for gene-gene link prediction using mini-batch training
-    on a graph containing only gene nodes.
+    Trains the model for one epoch on the full training graph.
     """
     model.train()
-    losses = []
-    node_type_list, idx_to_gene, idx_to_disease = properties # node_type_list & idx_to_disease are not used in the core loop now
+    optimizer.zero_grad()
 
-    gene_nodes_original_indices_list = list(idx_to_gene.keys())
-    if not gene_nodes_original_indices_list:
-        print("Warning: No gene nodes found in 'idx_to_gene'. Cannot train.")
-        return losses
+    # Move data to device
+    # train_data is already on CPU from prepare_data, RandomLinkSplit.
+    # We need to move its components.
+    x = train_data.x.to(device)
+    edge_index = train_data.edge_index.to(device) # Message-passing edges
+    edge_label_index = train_data.edge_label_index.to(device) # Supervision edges
+    edge_label = train_data.edge_label.to(device) # Supervision labels
 
-    gene_nodes_original_indices = torch.tensor(gene_nodes_original_indices_list, dtype=torch.long)
+    # GNN forward pass using all training edges for message passing
+    node_embeddings = model(x, edge_index)
 
-    # Ensure original data tensors are on a consistent device for subgraph operation
-    # and that gene_nodes_original_indices is also on that device.
-    # Assuming data.x and data.edge_index are on the same device.
-    original_data_device = data.x.device
-    if data.edge_index.device != original_data_device:
-        # This case should ideally not happen if Data object is consistent
-        data.edge_index = data.edge_index.to(original_data_device)
+    # Decode scores for the supervision links
+    pred_scores = model.decode(node_embeddings, edge_label_index)
     
-    gene_nodes_original_indices = gene_nodes_original_indices.to(original_data_device)
+    loss = criterion(pred_scores, edge_label)
+    loss.backward()
+    optimizer.step()
+    
+    return loss.item()
 
-    # Filter out original indices not present in data.num_nodes (e.g., if idx_to_gene is stale)
-    valid_gene_indices_mask = gene_nodes_original_indices < data.num_nodes
-    gene_nodes_original_indices = gene_nodes_original_indices[valid_gene_indices_mask]
 
-    if gene_nodes_original_indices.numel() == 0:
-        print("Warning: No valid gene nodes remaining after filtering. Cannot train.")
-        return losses
-        
-    # Create a new Data object containing only gene nodes and their edges
-    gene_only_data = data.subgraph(gene_nodes_original_indices)
-
-    if gene_only_data.num_nodes == 0:
-        print("Warning: Gene-only subgraph is empty. Cannot train.")
-        return losses
-
-    # NeighborLoader expects input_nodes to be relative to the data it's given
-    # and data to be on CPU.
-    loader = NeighborLoader(
-        gene_only_data.cpu(), 
-        input_nodes=None, # Samples all nodes from gene_only_data
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        shuffle=True
-    )
-
-    model_device = next(model.parameters()).device
-
-    for epoch in range(epochs):
-        total_loss = 0
-        for batch_idx, batch in enumerate(tqdm.tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}")):
-            if batch.num_nodes == 0: # Should not happen if gene_only_data is not empty
-                continue
-
-            optimizer.zero_grad() # Clear gradients for this batch
-
-            batch = batch.to(model_device)
-            z = model(batch.x, batch.edge_index)
-
-            # All edges in the batch are positive gene-gene edges
-            pos_edge_index = batch.edge_index
-            if pos_edge_index.shape[1] == 0: # No positive edges in this batch
-                # If there are nodes, but no edges, we might still want to learn something (e.g. predict no links)
-                # or skip if loss calculation requires positive edges.
-                # For now, if no positive edges, we can't form positive samples.
-                if batch.num_nodes >= 2: # Check if negative sampling is possible
-                    batch_local_node_indices = list(range(batch.num_nodes))
-                    all_possible_pairs_in_batch = set(itertools.combinations(batch_local_node_indices, 2))
-                    neg_pairs_local = list(all_possible_pairs_in_batch) # All pairs are negative
-                    np.random.shuffle(neg_pairs_local)
-                    # Sample a reasonable number of negatives, e.g., batch_size or a fixed number
-                    neg_pairs_local = neg_pairs_local[:batch_size] 
-                    if not neg_pairs_local:
-                        continue
-                    neg_edge_index = torch.tensor(neg_pairs_local, dtype=torch.long, device=z.device).t().contiguous()
-                    neg_scores = model.decode(z, neg_edge_index)
-                    
-                    scores = neg_scores
-                    labels = torch.zeros(neg_scores.size(0), device=scores.device)
-                else: # Not enough nodes for any pairs
-                    continue
-            else:
-                pos_scores = model.decode(z, pos_edge_index)
-
-                # Negative sampling within the batch (all nodes are genes)
-                batch_local_node_indices = list(range(batch.num_nodes))
-                
-                if batch.num_nodes < 2: # Not enough nodes to form pairs beyond existing
-                    scores = pos_scores
-                    labels = torch.ones(pos_scores.size(0), device=scores.device)
-                else:
-                    all_possible_pairs_in_batch = set(itertools.combinations(batch_local_node_indices, 2))
-                    
-                    existing_edges_in_batch = set()
-                    for i in range(pos_edge_index.shape[1]):
-                        u, v = pos_edge_index[0, i].item(), pos_edge_index[1, i].item()
-                        existing_edges_in_batch.add(tuple(sorted((u, v))))
-                    
-                    neg_pairs_local = list(all_possible_pairs_in_batch - existing_edges_in_batch)
-                    np.random.shuffle(neg_pairs_local)
-                    # Sample as many negatives as positives, or up to a max
-                    neg_pairs_local = neg_pairs_local[:pos_edge_index.shape[1]] 
-                    
-                    if not neg_pairs_local and pos_scores.numel() == 0: # No positive and no negative
-                        continue
-                    elif not neg_pairs_local: # Only positive scores
-                        scores = pos_scores
-                        labels = torch.ones(pos_scores.size(0), device=scores.device)
-                    else: # Both positive and negative scores
-                        neg_edge_index = torch.tensor(neg_pairs_local, dtype=torch.long, device=z.device).t().contiguous()
-                        neg_scores = model.decode(z, neg_edge_index)
-                        scores = torch.cat([pos_scores, neg_scores])
-                        labels = torch.cat([
-                            torch.ones(pos_scores.size(0), device=scores.device),
-                            torch.zeros(neg_scores.size(0), device=scores.device)
-                        ])
-            
-            if scores.numel() == 0: # No scores to compute loss on
-                continue
-
-            loss = criterion(scores, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            
-        avg_loss = total_loss / (batch_idx + 1) if (batch_idx + 1) > 0 else 0 # len(loader) might be 0 if gene_only_data is too small
-        losses.append(avg_loss)
-        print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
-    return losses
-
-def test_link_prediction(model: GraphiStasis,
-                         data: Data,
-                         properties: list,
-                         batch_size=1024,
-                         num_neighbors=[10, 10],
-                         test_epochs=1): # test_epochs is usually 1 for full evaluation
+@torch.no_grad()
+def evaluate_link_predictor(model: GraphiStasis, 
+                            data_split: Data, 
+                            train_graph_edge_index: torch.Tensor, 
+                            device: torch.device,
+                            desc: str = "Evaluating", # Description for tqdm
+                            eval_batch_size: int = 2048 # Batch size for evaluating links
+                            ) -> dict:
     """
-    Evaluate the GraphiStasis GNN model for gene-gene link prediction using mini-batch inference
-    on a graph containing only gene nodes.
-    Returns ROC AUC and average precision.
+    Evaluates the model on a given data split (validation or test).
+    Uses the training graph structure for generating node embeddings.
+    Includes a progress bar for link decoding.
     """
     model.eval()
-    node_type_list, idx_to_gene, idx_to_disease = properties # node_type_list & idx_to_disease are not used
 
-    gene_nodes_original_indices_list = list(idx_to_gene.keys())
-    if not gene_nodes_original_indices_list:
-        print("Warning: No gene nodes found in 'idx_to_gene'. Cannot test.")
-        return {'roc_auc': 0.0, 'avg_precision': 0.0}
+    # Generate embeddings for ALL nodes using the full feature set (data_split.x)
+    # and the message passing edges from the TRAINING graph.
+    all_node_embeddings = model(data_split.x.to(device), train_graph_edge_index.to(device))
 
-    gene_nodes_original_indices = torch.tensor(gene_nodes_original_indices_list, dtype=torch.long)
+    # Decode scores for the supervision links in the current data_split
+    # data_split.edge_label_index contains the positive and negative links to evaluate
     
-    original_data_device = data.x.device
-    if data.edge_index.device != original_data_device:
-        data.edge_index = data.edge_index.to(original_data_device)
-    gene_nodes_original_indices = gene_nodes_original_indices.to(original_data_device)
+    y_scores_list = []
+    y_true_list = []
 
-    valid_gene_indices_mask = gene_nodes_original_indices < data.num_nodes
-    gene_nodes_original_indices = gene_nodes_original_indices[valid_gene_indices_mask]
-
-    if gene_nodes_original_indices.numel() == 0:
-        print("Warning: No valid gene nodes remaining after filtering. Cannot test.")
-        return {'roc_auc': 0.0, 'avg_precision': 0.0}
-
-    gene_only_data = data.subgraph(gene_nodes_original_indices)
-
-    if gene_only_data.num_nodes == 0:
-        print("Warning: Gene-only subgraph is empty. Cannot test.")
-        return {'roc_auc': 0.0, 'avg_precision': 0.0}
-
-    loader = NeighborLoader(
-        gene_only_data.cpu(),
-        input_nodes=None, # Samples all nodes
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        shuffle=False 
-    )
-
-    all_y_true = []
-    all_y_scores = []
-    model_device = next(model.parameters()).device
-
-    with torch.no_grad():
-        for _ in range(test_epochs): 
-            for batch in tqdm.tqdm(loader, desc="Testing"):
-                if batch.num_nodes == 0:
-                    continue
-
-                batch = batch.to(model_device)
-                z = model(batch.x, batch.edge_index)
-
-                pos_edge_index = batch.edge_index
-                pos_scores = torch.tensor([], device=z.device) # Initialize as empty
-                
-                if pos_edge_index.shape[1] > 0:
-                    pos_scores = torch.sigmoid(model.decode(z, pos_edge_index))
-
-                neg_scores = torch.tensor([], device=z.device) # Initialize as empty
-                if batch.num_nodes >= 2:
-                    batch_local_node_indices = list(range(batch.num_nodes))
-                    all_possible_pairs_in_batch = set(itertools.combinations(batch_local_node_indices, 2))
-                    
-                    existing_edges_in_batch = set()
-                    if pos_edge_index.shape[1] > 0:
-                        for i in range(pos_edge_index.shape[1]):
-                            u, v = pos_edge_index[0, i].item(), pos_edge_index[1, i].item()
-                            existing_edges_in_batch.add(tuple(sorted((u, v))))
-
-                    neg_pairs_local = list(all_possible_pairs_in_batch - existing_edges_in_batch)
-                    np.random.shuffle(neg_pairs_local)
-                    
-                    # For testing, it's common to evaluate on all or a larger sample of negatives.
-                    # Here, we sample as many as positives for consistency, or up to batch_size if no positives.
-                    num_neg_samples = pos_edge_index.shape[1] if pos_edge_index.shape[1] > 0 else batch_size
-                    neg_pairs_local = neg_pairs_local[:num_neg_samples]
-                    
-                    if neg_pairs_local:
-                        neg_edge_index = torch.tensor(neg_pairs_local, dtype=torch.long, device=z.device).t().contiguous()
-                        neg_scores = torch.sigmoid(model.decode(z, neg_edge_index))
-
-                if pos_scores.numel() > 0 or neg_scores.numel() > 0:
-                    y_true_batch = torch.cat([
-                        torch.ones(pos_scores.size(0), device=pos_scores.device),
-                        torch.zeros(neg_scores.size(0), device=neg_scores.device)
-                    ])
-                    y_scores_batch = torch.cat([pos_scores, neg_scores])
-
-                    all_y_true.append(y_true_batch.cpu())
-                    all_y_scores.append(y_scores_batch.cpu())
-
-    if not all_y_true:
-        print("No valid batches processed for evaluation. Returning zero metrics.")
-        return {'roc_auc': 0.0, 'avg_precision': 0.0}
-
-    all_y_true_np = torch.cat(all_y_true).numpy()
-    all_y_scores_np = torch.cat(all_y_scores).numpy()
-
-    if len(all_y_true_np) == 0:
-        print("Evaluation resulted in no samples. Returning zero metrics.")
-        return {'roc_auc': 0.0, 'avg_precision': 0.0}
+    num_links_to_eval = data_split.edge_label_index.shape[1]
     
-    unique_labels = np.unique(all_y_true_np)
-    if len(unique_labels) < 2:
-        print(f"Warning: Evaluation data contains only one class ({unique_labels}). ROC AUC and Avg Precision are undefined or misleading.")
-        # Return 0.5 for ROC AUC if all labels are the same (chance level for a common interpretation)
-        # Avg precision is more complex; 1.0 if all are positive and predicted as positive, 0.0 if all are negative.
-        # For simplicity, returning 0.0 or a representative value.
-        roc_auc_val = 0.5 
-        avg_precision_val = float(unique_labels[0]) if len(unique_labels) == 1 and unique_labels[0] == 1 and np.all(all_y_scores_np > 0.5) else 0.0 # crude
-        return {'roc_auc': roc_auc_val, 'avg_precision': avg_precision_val}
+    # Iterate over edge_label_index in chunks for progress bar
+    for i in tqdm.tqdm(range(0, num_links_to_eval, eval_batch_size), desc=desc, leave=False):
+        batch_edge_label_index = data_split.edge_label_index[:, i:i+eval_batch_size].to(device)
+        batch_edge_label = data_split.edge_label[i:i+eval_batch_size] # Corresponding labels
 
-    roc_auc = roc_auc_score(all_y_true_np, all_y_scores_np)
-    # precision_recall_curve can error if only one class in y_true or if y_scores is constant.
-    try:
-        precision, recall, _ = precision_recall_curve(all_y_true_np, all_y_scores_np)
-        # trapz can fail if precision or recall are empty or have single values.
+        if batch_edge_label_index.shape[1] == 0:
+            continue
+
+        batch_pred_scores_logits = model.decode(all_node_embeddings, batch_edge_label_index)
+        batch_pred_scores_sigmoid = torch.sigmoid(batch_pred_scores_logits)
+        
+        y_scores_list.append(batch_pred_scores_sigmoid.cpu())
+        y_true_list.append(batch_edge_label.cpu())
+
+    if not y_true_list: # No links were evaluated
+        print(f"Warning: No links evaluated in {desc}. Returning default metrics.")
+        return {'roc_auc': 0.0, 'avg_precision': 0.0}
+
+    true_labels = torch.cat(y_true_list).numpy()
+    pred_scores_np = torch.cat(y_scores_list).numpy()
+
+
+    if len(np.unique(true_labels)) < 2:
+        roc_auc = 0.5 
+        avg_precision = np.mean(true_labels) if len(true_labels) > 0 else 0.0
+        print(f"Warning: Evaluation data in '{desc}' contains only one class ({np.unique(true_labels)}). Metrics might be misleading.")
+    else:
+        roc_auc = roc_auc_score(true_labels, pred_scores_np)
+        precision, recall, _ = precision_recall_curve(true_labels, pred_scores_np)
         avg_precision = np.trapz(recall, precision) if len(recall) > 1 and len(precision) > 1 else 0.0
-        if not np.isfinite(avg_precision): avg_precision = 0.0 # Handle NaN/inf from trapz
-    except ValueError:
-        print("Warning: Could not compute precision-recall curve. Returning 0 for avg_precision.")
-        avg_precision = 0.0
-
+        if not np.isfinite(avg_precision): avg_precision = 0.0
 
     return {'roc_auc': roc_auc, 'avg_precision': avg_precision}
+
+
+def run_training_pipeline(
+    model_class: type, # e.g., GraphiStasis
+    model_args: dict,
+    train_data: Data, # From RandomLinkSplit
+    val_data: Data,   # From RandomLinkSplit
+    test_data: Data,  # From RandomLinkSplit
+    epochs: int = 5,
+    # batch_size and num_neighbors_loader are removed as we are doing full-graph training
+    learning_rate: float = 0.01,
+    early_stopping_patience: int = 2, # Set to None to disable
+    eval_batch_size: int = 2048 # Batch size for evaluate_link_predictor
+    ) -> tuple:
+    """
+    Main pipeline to train, validate, and test the GNN link predictor using full-graph training.
+    """
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    if 'in_channels' not in model_args and hasattr(train_data, 'num_node_features'):
+        model_args['in_channels'] = train_data.num_node_features
+    elif 'in_channels' not in model_args:
+        # Assuming pyg_data.x was set to degrees which is 1 feature
+        # If using other features (e.g. GenePT), this needs to be accurate
+        num_features = train_data.x.shape[1] if train_data.x is not None and train_data.x.dim() > 1 else 1
+        print(f"Warning: 'in_channels' not specified in model_args. Setting to {num_features} based on train_data.x.shape.")
+        model_args['in_channels'] = num_features
+
+
+    model = model_class(**model_args).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.BCEWithLogitsLoss() 
+
+    # No LinkNeighborLoader needed for full-graph training
+
+    best_val_metric = 0.0
+    epochs_no_improve = 0
+    history = {'train_loss': [], 'val_roc_auc': [], 'val_avg_precision': []}
+
+    # The edge_index for message passing during evaluation should be from the training graph
+    # This is train_data.edge_index as returned by RandomLinkSplit
+    # Ensure it's on the correct device for evaluate_link_predictor
+    train_graph_message_passing_edges_eval = train_data.edge_index # This will be moved to device inside evaluate_link_predictor
+
+    # Main epoch loop with overall progress bar
+    # tqdm is imported in your script
+    for epoch in tqdm.tqdm(range(1, epochs + 1), desc="Overall Epochs"):
+        # Pass the full train_data to train_one_epoch
+        # train_data's components will be moved to device inside train_one_epoch
+        avg_train_loss = train_one_epoch(model, train_data, optimizer, criterion, device)
+        history['train_loss'].append(avg_train_loss)
+        
+        # val_data components will be moved to device inside evaluate_link_predictor
+        val_metrics = evaluate_link_predictor(model, val_data, train_graph_message_passing_edges_eval, device, desc="Validating", eval_batch_size=eval_batch_size)
+        history['val_roc_auc'].append(val_metrics['roc_auc'])
+        history['val_avg_precision'].append(val_metrics['avg_precision'])
+
+        # Print epoch summary
+        print(f"\nEpoch {epoch:03d} Summary: Train Loss: {avg_train_loss:.4f}, "
+              f"Val ROC AUC: {val_metrics['roc_auc']:.4f}, Val Avg Precision: {val_metrics['avg_precision']:.4f}")
+
+        current_val_metric = val_metrics['roc_auc'] 
+        if early_stopping_patience is not None:
+            if current_val_metric > best_val_metric:
+                best_val_metric = current_val_metric
+                epochs_no_improve = 0
+                # torch.save(model.state_dict(), 'best_model.pth')
+            else:
+                epochs_no_improve += 1
+            
+            if epochs_no_improve >= early_stopping_patience:
+                print(f"\nEarly stopping triggered after {early_stopping_patience} epochs with no improvement.")
+                break
+    
+    # if early_stopping_patience is not None and os.path.exists('best_model.pth'):
+    #     model.load_state_dict(torch.load('best_model.pth'))
+    #     print("\nLoaded best model for final testing.")
+
+    print("\nStarting final testing...")
+    # test_data components will be moved to device inside evaluate_link_predictor
+    test_metrics = evaluate_link_predictor(model, test_data, train_graph_message_passing_edges_eval, device, desc="Testing", eval_batch_size=eval_batch_size)
+    print(f"\nFinal Test Metrics: ROC AUC: {test_metrics['roc_auc']:.4f}, Avg Precision: {test_metrics['avg_precision']:.4f}")
+
+    return model, history, test_metrics
 
 def visualize_loss(losses, title="Loss Curve", xlabel="Epochs", ylabel="Loss"):
     """
