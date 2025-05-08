@@ -391,3 +391,4 @@ def load_graph(file_path):
     """
     graph = nx.read_gml(file_path)
     return graph
+
