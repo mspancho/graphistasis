@@ -93,33 +93,33 @@ def prepare_data(graph: nx.Graph) -> Data:
     node_type_list = []
     idx_to_gene = {}
     idx_to_disease = {}
-    embedding_dim = len(next(iter(gene_embedding_dict.values())))
-    embeddings = []
+    # embedding_dim = len(next(iter(gene_embedding_dict.values())))
+    # embeddings = []
     for idx, (n, d) in enumerate(graph.nodes(data=True)):
         node_type = d.get('node_type', None) or d.get('type', None)
         node_type_list.append(node_type)
         node_name = d.get('name', str(n))
         if node_type == 1:
             idx_to_gene[idx] = node_name
-            emb = gene_embedding_dict.get(node_name, np.zeros(embedding_dim))
+            # emb = gene_embedding_dict.get(node_name, np.zeros(embedding_dim))
         if node_type == 2:
             idx_to_disease[idx] = node_name
-            emb = np.zeros(embedding_dim)
-        embeddings.append(emb)
+        #     emb = np.zeros(embedding_dim)
+        # embeddings.append(emb)
     print("Idx -> [Gene, Disease] mapping done")
-    pyg_data.x = torch.tensor(np.stack(embeddings), dtype=torch.float32)
-    print("After setting embeddings, x shape:", pyg_data.x.shape)
+    # pyg_data.x = torch.tensor(np.stack(embeddings), dtype=torch.float32)
+    # print("After setting embeddings, x shape:", pyg_data.x.shape)
 
     # Use degree as a feature bc large graph
-    # degrees = torch.tensor([val for (_, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
-    # pyg_data.x = degrees
-    # print("After setting degrees, x shape:", pyg_data.x.shape)
+    degrees = torch.tensor([val for (_, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
+    pyg_data.x = degrees
+    print("After setting degrees, x shape:", pyg_data.x.shape)
 
     # Debug prints
     try:
         print("x.shape[0]:", pyg_data.x.shape[0])
         print("edge_index.max():", pyg_data.edge_index.max())
-        if pyg_data.x.shape[0] > pyg_data.edge_index.max():
+        if pyg_data.x.shape[0] < pyg_data.edge_index.max():
             print("Warning: Edge indices reference node indices not in feature matrix.")
         else:
             print("Aight ur chillin prolly")
