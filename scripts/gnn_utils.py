@@ -248,7 +248,12 @@ def evaluate_link_predictor(model: GraphiStasis,
         avg_precision = np.trapz(recall, precision) if len(recall) > 1 and len(precision) > 1 else 0.0
         if not np.isfinite(avg_precision): avg_precision = 0.0
 
-    return {'roc_auc': roc_auc, 'avg_precision': avg_precision}
+    return {
+        'roc_auc': roc_auc,
+        'avg_precision': avg_precision,
+        'y_true': true_labels,
+        'y_scores': pred_scores_np
+    }
 
 
 def run_training_pipeline(
@@ -290,13 +295,12 @@ def run_training_pipeline(
     epochs_no_improve = 0
     history = {'train_loss': [], 'val_roc_auc': [], 'val_avg_precision': []}
 
-    # The edge_index for message passing during evaluation should be from the training graph
-    # This is train_data.edge_index as returned by RandomLinkSplit
+    # edge_index for message passing during eval should be from training graph
+    # train_data.edge_index as returned by RandomLinkSplit
     # Ensure it's on the correct device for evaluate_link_predictor
-    train_graph_message_passing_edges_eval = train_data.edge_index # This will be moved to device inside evaluate_link_predictor
+    train_graph_message_passing_edges_eval = train_data.edge_index # moved to device in evaluate_link_predictor
 
     # Main epoch loop with overall progress bar
-    # tqdm is imported in your script
     for epoch in tqdm.tqdm(range(1, epochs + 1), desc="Overall Epochs"):
         # Pass the full train_data to train_one_epoch
         # train_data's components will be moved to device inside train_one_epoch
