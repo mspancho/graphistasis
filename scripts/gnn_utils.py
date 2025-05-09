@@ -2,7 +2,8 @@ import torch_geometric as pyg
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 from torch_geometric.explain.algorithm import GNNExplainer
 from torch_geometric.data import Data
-from torch_geometric.loader import NeighborLoader
+from torch_geometric.loader import NeighborLoader, LinkNeighborLoader
+from torch_geometric.transforms import RandomLinkSplit
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -21,7 +22,7 @@ from sklearn.metrics import precision_score
 import networkx as nx
 import tqdm
 import itertools
-
+import pickle
 
 class GraphiStasis(nn.Module):
     """
@@ -68,8 +69,9 @@ class GraphiStasis(nn.Module):
             edge_mask, node_feat_mask
         """
         explainer = GNNExplainer(self, epochs=epochs)
+        # Get edge mask and node feature mask for the given edge
         edge_mask, node_feat_mask = explainer.explain_link(edge, data.x, data.edge_index)
-        if visualize:
+        if visualize: # Visualize the explanation
             explainer.visualize_subgraph(edge, data.edge_index, edge_mask, y=None, threshold=None)
         return edge_mask, node_feat_mask
 
@@ -79,338 +81,415 @@ def prepare_data(graph: nx.Graph) -> Data:
     Returns a PyTorch Geometric Data object.
     """
 
+    # Unpickle embedding dict file (read-binary mode)
+    with open("genept/GenePT_gene_embedding_ada_text.pickle", "rb") as f:
+        gene_embedding_dict = pickle.load(f)
+
+    # Convert NetworkX graph to PyTorch Geometric Data object
     graph = nx.convert_node_labels_to_integers(graph)
     pyg_data = pyg.utils.from_networkx(graph)
 
+    # Keep track of graph attributes
     node_type_list = []
     idx_to_gene = {}
     idx_to_disease = {}
+    embedding_dim = len(next(iter(gene_embedding_dict.values())))
+    embeddings = []
     for idx, (n, d) in enumerate(graph.nodes(data=True)):
         node_type = d.get('node_type', None) or d.get('type', None)
         node_type_list.append(node_type)
-        if node_type == 'gene':
-            idx_to_gene[idx] = d.get('name', str(n))
-        if node_type == 'disease':
-            idx_to_disease[idx] = d.get('name', str(n))
-    pyg_data.node_type_list = node_type_list
-    pyg_data.idx_to_gene = idx_to_gene
-    pyg_data.idx_to_disease = idx_to_disease
+        node_name = d.get('name', str(n))
+        if node_type == 1:
+            idx_to_gene[idx] = node_name
+            emb = gene_embedding_dict.get(node_name, np.zeros(embedding_dim))
+        if node_type == 2:
+            idx_to_disease[idx] = node_name
+            emb = np.zeros(embedding_dim)
+        embeddings.append(emb)
+    print("Idx -> [Gene, Disease] mapping done")
+    pyg_data.x = torch.tensor(np.stack(embeddings), dtype=torch.float32)
+    print("After setting embeddings, x shape:", pyg_data.x.shape)
 
-    # Use degree as a feature (recommended for large graphs)
-    degrees = torch.tensor([val for (_, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
-    pyg_data.x = degrees
-    print("After setting degrees, x shape:", pyg_data.x.shape)
+    # Use degree as a feature bc large graph
+    # degrees = torch.tensor([val for (_, val) in graph.degree()], dtype=torch.float32).unsqueeze(1)
+    # pyg_data.x = degrees
+    # print("After setting degrees, x shape:", pyg_data.x.shape)
 
     # Debug prints
     try:
         print("x.shape[0]:", pyg_data.x.shape[0])
         print("edge_index.max():", pyg_data.edge_index.max())
-        if pyg_data.x.shape[0] > pyg_data.edge_index.max():
+        if pyg_data.x.shape[0] < pyg_data.edge_index.max():
             print("Warning: Edge indices reference node indices not in feature matrix.")
         else:
             print("Aight ur chillin prolly")
     except Exception as e:
         print("Error in prepare_data print statements:", e)
 
-    return pyg_data
+    if hasattr(pyg_data, 'name'): del pyg_data.name
 
-def get_gene_indices(data):
-    return [i for i, t in enumerate(data.node_type_list) if t == 'gene']
+    if not hasattr(pyg_data, 'name'): print("Name removed from pyg_data")
+    print(pyg_data)
+    transform = RandomLinkSplit(is_undirected=True)
+    train_data, val_data, test_data = transform(pyg_data)
 
-def get_disease_indices(data):
-    return [i for i, t in enumerate(data.node_type_list) if t == 'disease']
+    return train_data, val_data, test_data, [node_type_list, idx_to_gene, idx_to_disease]
 
-def get_gene_gene_edges(data):
+def compute_binary_accuracy(y_pred_logits, y_true):
     """
-    Returns edge_index containing only gene-gene edges.
+    Compute binary accuracy given logits and true labels.
     """
-    mask = []
-    node_type_list = getattr(data, 'node_type_list', None)
-    if node_type_list is None:
-        raise ValueError("node_type_list not found in data. Run prepare_data with node_type attributes.")
-    for i in range(data.edge_index.shape[1]):
-        src, dst = data.edge_index[0, i].item(), data.edge_index[1, i].item()
-        if node_type_list[src] == 'gene' and node_type_list[dst] == 'gene':
-            mask.append(i)
-    if len(mask) == 0:
-        raise ValueError("No gene-gene edges found in the graph.")
-    return data.edge_index[:, mask]
+    y_pred = torch.sigmoid(y_pred_logits) > 0.5
+    if isinstance(y_true, torch.Tensor):
+        y_true = y_true.bool()
+    else:
+        y_true = torch.tensor(y_true).bool()
+    return (y_pred.cpu() == y_true.cpu()).float().mean().item()
 
-def mini_batch_train_link_prediction(model: GraphiStasis, data: Data, optimizer, criterion, epochs=10, batch_size=1024, num_neighbors=[10, 10]):
-    model.train()
-    losses = []
-    gene_indices = list(data.idx_to_gene.keys())
-    disease_indices = set(data.idx_to_disease.keys())
-
-    loader = NeighborLoader(
-        data.cpu(),
-        input_nodes=gene_indices,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        shuffle=True
-    )
-
-    for epoch in range(epochs):
-        total_loss = 0
-        for batch in tqdm.tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            # Ensure at least one disease node in the batch
-            batch_disease = [i for i in batch.n_id.tolist() if i in disease_indices]
-            if not batch_disease:
-                continue  # Skip this batch
-
-            batch = batch.to(next(model.parameters()).device)
-            z = model(batch.x, batch.edge_index)
-
-            # Get gene-gene edges in the batch
-            mask = []
-            for i in range(batch.edge_index.shape[1]):
-                src, dst = batch.edge_index[0, i].item(), batch.edge_index[1, i].item()
-                if batch.node_type_list[src] == 'gene' and batch.node_type_list[dst] == 'gene':
-                    mask.append(i)
-            if not mask:
-                continue
-            pos_edge_index = batch.edge_index[:, mask]
-            pos_scores = model.decode(z, pos_edge_index)
-
-            # Negative sampling within the batch
-            batch_gene_indices = [i for i, t in enumerate(batch.node_type_list) if t == 'gene']
-            all_gene_pairs = set(itertools.combinations(batch_gene_indices, 2))
-            existing_gene_edges = set(tuple(sorted((pos_edge_index[0, i].item(), pos_edge_index[1, i].item()))) for i in range(pos_edge_index.shape[1]))
-            neg_pairs = list(all_gene_pairs - existing_gene_edges)
-            np.random.shuffle(neg_pairs)
-            neg_pairs = neg_pairs[:pos_edge_index.shape[1]]
-            if not neg_pairs:
-                continue
-            neg_edge_index = torch.tensor(neg_pairs, dtype=torch.long).t().contiguous()
-            neg_scores = model.decode(z, neg_edge_index)
-
-            scores = torch.cat([pos_scores, neg_scores])
-            labels = torch.cat([
-                torch.ones(pos_scores.size(0), device=scores.device),
-                torch.zeros(neg_scores.size(0), device=scores.device)
-            ])
-
-            loss = criterion(scores, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        losses.append(total_loss)
-        print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
-    return losses
-
-# def train_link_prediction(model, data, optimizer, criterion, epochs=100):
+def train_one_epoch(model: GraphiStasis,
+                    train_data: Data, # Full training data
+                    optimizer: optim.Adam,
+                    criterion: nn.Module,
+                    device: torch.device) -> tuple:
     """
-    Train the GraphiStasis GNN model for link prediction.
+    Trains the model for one epoch on the full training graph.
+    Returns (loss, accuracy).
     """
     model.train()
-    losses = []
-    from torch_geometric.utils import negative_sampling
+    optimizer.zero_grad()
 
-    # Only gene-gene edges for training
-    pos_edge_index = get_gene_gene_edges(data)
+    # Move data to device
+    # train_data should already be on CPU from prepare_data, RandomLinkSplit
+    x = train_data.x.to(device)
+    edge_index = train_data.edge_index.to(device) # Message-passing edges
+    edge_label_index = train_data.edge_label_index.to(device) # Supervision edges
+    edge_label = train_data.edge_label.to(device) # Supervision labels
 
-    for epoch in tqdm.trange(epochs, desc="Training"):
-        optimizer.zero_grad()
-        z = model(data.x, data.edge_index)  # Node embeddings
+    # GNN forward pass using all training edges for message passing
+    node_embeddings = model(x, edge_index)
 
-        # Positive edge scores (gene-gene only)
-        pos_scores = model.decode(z, pos_edge_index)
+    # Decode scores for the supervision links
+    pred_scores = model.decode(node_embeddings, edge_label_index)
+    
+    # Compute loss
+    loss = criterion(pred_scores, edge_label)
+    loss.backward()
+    optimizer.step()
 
-        # Negative edge sampling (gene-gene only)
-        gene_indices = [i for i, t in enumerate(data.node_type_list) if t == 'gene']
-        # All possible gene-gene pairs (excluding self-loops and existing edges)
-        all_gene_pairs = set(itertools.combinations(gene_indices, 2))
-        existing_gene_edges = set(tuple(sorted((pos_edge_index[0, i].item(), pos_edge_index[1, i].item()))) for i in range(pos_edge_index.shape[1]))
-        neg_pairs = list(all_gene_pairs - existing_gene_edges)
-        # Sample negatives up to the number of positives
-        np.random.shuffle(neg_pairs)
-        neg_pairs = neg_pairs[:pos_edge_index.shape[1]]
-        if len(neg_pairs) == 0:
-            raise ValueError("No negative gene-gene pairs available for sampling.")
-        neg_edge_index = torch.tensor(neg_pairs, dtype=torch.long).t().contiguous()
-        neg_scores = model.decode(z, neg_edge_index)
+    acc = compute_binary_accuracy(pred_scores, edge_label)
+    return loss.item(), acc
 
-        # Labels: 1 for positive, 0 for negative
-        scores = torch.cat([pos_scores, neg_scores])
-        labels = torch.cat([
-            torch.ones(pos_scores.size(0), device=scores.device),
-            torch.zeros(neg_scores.size(0), device=scores.device)
-        ])
 
-        loss = criterion(scores, labels)
-        loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
-
-    return losses
-
-# def test_link_prediction(model, data, test_epochs=1):
+@torch.no_grad()
+def evaluate_link_predictor(model: GraphiStasis, 
+                            data_split: Data, 
+                            train_graph_edge_index: torch.Tensor, 
+                            device: torch.device,
+                            desc: str = "Evaluating", # Description for tqdm
+                            eval_batch_size: int = 2048 # Batch size for evaluating links
+                            ) -> dict:
     """
-    Evaluate the GraphiStasis GNN model for link prediction.
-    Returns ROC AUC and average precision.
+    Evaluates the model on a given data split (validation or test).
+    Uses the training graph structure for generating node embeddings.
+    Includes a progress bar for link decoding.
+    Returns dict with ROC AUC, avg precision, accuracy, y_true, y_scores.
     """
     model.eval()
-    results = []
-    from torch_geometric.utils import negative_sampling
 
-    pos_edge_index = get_gene_gene_edges(data)
-    gene_indices = [i for i, t in enumerate(data.node_type_list) if t == 'gene']
-    all_gene_pairs = set(itertools.combinations(gene_indices, 2))
-    existing_gene_edges = set(tuple(sorted((pos_edge_index[0, i].item(), pos_edge_index[1, i].item()))) for i in range(pos_edge_index.shape[1]))
-    neg_pairs = list(all_gene_pairs - existing_gene_edges)
-    np.random.shuffle(neg_pairs)
-    neg_pairs = neg_pairs[:pos_edge_index.shape[1]]
-    if len(neg_pairs) == 0:
-        raise ValueError("No negative gene-gene pairs available for sampling.")
-    neg_edge_index = torch.tensor(neg_pairs, dtype=torch.long).t().contiguous()
+    # Generate embeddings for ALL nodes using the full feature set (data_split.x)
+    # and the message passing edges from the TRAINING graph
+    all_node_embeddings = model(data_split.x.to(device), train_graph_edge_index.to(device))
 
-    with torch.no_grad():
-        for _ in tqdm.trange(test_epochs, desc="Testing"):
-            z = model(data.x, data.edge_index)
-            pos_scores = torch.sigmoid(model.decode(z, pos_edge_index))
-            neg_scores = torch.sigmoid(model.decode(z, neg_edge_index))
+    # Decode scores for the supervision links in the current data_split
+    # data_split.edge_label_index contains (+) and (-) links to evaluate
+    
+    y_scores_list = []
+    y_true_list = []
+    y_logits_list = []
 
-            y_true = torch.cat([
-                torch.ones(pos_scores.size(0), device=pos_scores.device),
-                torch.zeros(neg_scores.size(0), device=neg_scores.device)
-            ])
-            y_scores = torch.cat([pos_scores, neg_scores])
+    num_links_to_eval = data_split.edge_label_index.shape[1]
+    
+    # Iterate over edge_label_index in chunks for progress bar
+    for i in tqdm.tqdm(range(0, num_links_to_eval, eval_batch_size), desc=desc, leave=False):
+        batch_edge_label_index = data_split.edge_label_index[:, i:i+eval_batch_size].to(device)
+        batch_edge_label = data_split.edge_label[i:i+eval_batch_size] # Corresponding labels
 
-            roc_auc = roc_auc_score(y_true.cpu().numpy(), y_scores.cpu().numpy())
-            precision, recall, _ = precision_recall_curve(y_true.cpu().numpy(), y_scores.cpu().numpy())
-            avg_precision = np.trapz(precision, recall)
+        # Skip empty batches
+        if batch_edge_label_index.shape[1] == 0:
+            continue
 
-            results.append({'roc_auc': roc_auc, 'avg_precision': avg_precision})
+        # Decode scores for the current batch of links
+        batch_pred_scores_logits = model.decode(all_node_embeddings, batch_edge_label_index)
+        batch_pred_scores_sigmoid = torch.sigmoid(batch_pred_scores_logits)
+        
+        y_scores_list.append(batch_pred_scores_sigmoid.cpu())
+        y_true_list.append(batch_edge_label.cpu())
+        y_logits_list.append(batch_pred_scores_logits.cpu())
 
-    return {'roc_auc': roc_auc, 'avg_precision': avg_precision}
+    if not y_true_list: # No links were evaluated
+        print(f"Warning: No links evaluated in {desc}. Returning default metrics.")
+        return {'roc_auc': 0.0, 'avg_precision': 0.0, 'accuracy': 0.0, 'y_true': [], 'y_scores': []}
 
-def test_link_prediction(model: GraphiStasis, data: Data, batch_size=1024, num_neighbors=[10, 10], test_epochs=1):
+    # Concatenate all batches
+    true_labels = torch.cat(y_true_list).numpy()
+    pred_scores_np = torch.cat(y_scores_list).numpy()
+    pred_logits = torch.cat(y_logits_list)
+    acc = compute_binary_accuracy(pred_logits, torch.cat(y_true_list))
+
+    # Check if true_labels contains only one class
+    if len(np.unique(true_labels)) < 2:
+        roc_auc = 0.5 
+        avg_precision = np.mean(true_labels) if len(true_labels) > 0 else 0.0
+        print(f"Warning: Evaluation data in '{desc}' contains only one class ({np.unique(true_labels)}). Metrics might be misleading.")
+    else: # Normal eval
+        roc_auc = roc_auc_score(true_labels, pred_scores_np)
+        precision, recall, _ = precision_recall_curve(true_labels, pred_scores_np)
+        avg_precision = np.trapz(recall, precision) if len(recall) > 1 and len(precision) > 1 else 0.0
+        if not np.isfinite(avg_precision): avg_precision = 0.0
+
+    return {
+        'roc_auc': roc_auc,
+        'avg_precision': avg_precision,
+        'accuracy': acc,
+        'y_true': true_labels,
+        'y_scores': pred_scores_np
+    }
+
+
+def run_training_pipeline(
+    model_class: GraphiStasis,
+    model_args: dict,
+    train_data: Data, # From RandomLinkSplit
+    val_data: Data,   # From RandomLinkSplit
+    test_data: Data,  # From RandomLinkSplit
+    epochs: int = 50,
+    learning_rate: float = 0.01,
+    early_stopping_patience: int = 10, # Set to None to disable
+    eval_batch_size: int = 2048 # Batch size for evaluate_link_predictor
+    ) -> tuple:
     """
-    Evaluate the GraphiStasis GNN model for link prediction using mini-batch inference.
-    Returns ROC AUC and average precision.
+    Main pipeline to train, validate, and test the GNN link predictor using full-graph training.
     """
-    from torch_geometric.loader import NeighborLoader
-    from sklearn.metrics import roc_auc_score, precision_recall_curve
-    import tqdm
+    # device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    device = torch.device('cpu')
+    print(f"Using device: {device}")
 
-    model.eval()
-    results = []
-    gene_indices = list(data.idx_to_gene.keys())
-    disease_indices = set(data.idx_to_disease.keys())
+    # Ensure model input dims match the data
+    if 'in_channels' not in model_args and hasattr(train_data, 'num_node_features'):
+        model_args['in_channels'] = train_data.num_node_features
+    elif 'in_channels' not in model_args:
+        # If using other features (e.g. GenePT), this needs to be accurate
+        num_features = train_data.x.shape[1] if train_data.x is not None and train_data.x.dim() > 1 else 1
+        print(f"Warning: 'in_channels' not specified in model_args. Setting to {num_features} based on train_data.x.shape.")
+        model_args['in_channels'] = num_features
 
-    loader = NeighborLoader(
-        data.cpu(),
-        input_nodes=gene_indices,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        shuffle=False
-    )
+    # Initialize model, optimizer, and loss fn
+    model = model_class(**model_args).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.BCEWithLogitsLoss() 
 
-    all_y_true = []
-    all_y_scores = []
+    # Initialize early stopping variables
+    best_val_metric = 0.0
+    epochs_no_improve = 0
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_roc_auc': [],
+        'val_avg_precision': [],
+        'val_acc': []
+    }
 
-    with torch.no_grad():
-        for _ in range(test_epochs):
-            for batch in tqdm.tqdm(loader, desc="Testing"):
-                # Ensure at least one disease node in the batch
-                batch_disease = [i for i in batch.n_id.tolist() if i in disease_indices]
-                if not batch_disease:
-                    continue
+    # edge_index for message passing during eval should be from training graph
+    # train_data.edge_index as returned by RandomLinkSplit
+    # check correct device for evaluate_link_predictor
+    train_graph_message_passing_edges_eval = train_data.edge_index # moved to device in evaluate_link_predictor
 
-                batch = batch.to(next(model.parameters()).device)
-                z = model(batch.x, batch.edge_index)
+    # Main epoch loop with overall progress bar
+    for epoch in tqdm.tqdm(range(1, epochs + 1), desc="Overall Epochs"):
+        # Pass the full train_data to train_one_epoch
+        # train_data moved to device inside train_one_epoch
+        avg_train_loss, avg_train_acc = train_one_epoch(model, train_data, optimizer, criterion, device)
+        history['train_loss'].append(avg_train_loss)
+        history['train_acc'].append(avg_train_acc)
+        
+        # val_data components moved to device inside evaluate_link_predictor
+        val_metrics = evaluate_link_predictor(model, val_data, train_graph_message_passing_edges_eval, device, desc="Validating", eval_batch_size=eval_batch_size)
+        history['val_roc_auc'].append(val_metrics['roc_auc'])
+        history['val_avg_precision'].append(val_metrics['avg_precision'])
+        history['val_acc'].append(val_metrics['accuracy'])
 
-                # Get gene-gene edges in the batch
-                mask = []
-                for i in range(batch.edge_index.shape[1]):
-                    src, dst = batch.edge_index[0, i].item(), batch.edge_index[1, i].item()
-                    if batch.node_type_list[src] == 'gene' and batch.node_type_list[dst] == 'gene':
-                        mask.append(i)
-                if not mask:
-                    continue
-                pos_edge_index = batch.edge_index[:, mask]
-                pos_scores = torch.sigmoid(model.decode(z, pos_edge_index))
+        # Print epoch summary
+        print(f"\nEpoch {epoch:03d} Summary: Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f}, "
+              f"Val ROC AUC: {val_metrics['roc_auc']:.4f}, Val Avg Precision: {val_metrics['avg_precision']:.4f}, Val Acc: {val_metrics['accuracy']:.4f}")
 
-                # Negative sampling within the batch
-                batch_gene_indices = [i for i, t in enumerate(batch.node_type_list) if t == 'gene']
-                all_gene_pairs = set(itertools.combinations(batch_gene_indices, 2))
-                existing_gene_edges = set(tuple(sorted((pos_edge_index[0, i].item(), pos_edge_index[1, i].item()))) for i in range(pos_edge_index.shape[1]))
-                neg_pairs = list(all_gene_pairs - existing_gene_edges)
-                np.random.shuffle(neg_pairs)
-                neg_pairs = neg_pairs[:pos_edge_index.shape[1]]
-                if not neg_pairs:
-                    continue
-                neg_edge_index = torch.tensor(neg_pairs, dtype=torch.long).t().contiguous()
-                neg_scores = torch.sigmoid(model.decode(z, neg_edge_index))
+        # Early stopping check
+        current_val_metric = val_metrics['roc_auc'] 
+        if early_stopping_patience is not None:
+            if current_val_metric > best_val_metric:
+                best_val_metric = current_val_metric
+                epochs_no_improve = 0
+                # torch.save(model.state_dict(), 'best_model.pth')
+            else:
+                epochs_no_improve += 1
+            
+            if epochs_no_improve >= early_stopping_patience:
+                print(f"\nEarly stopping triggered after {early_stopping_patience} epochs with no improvement.")
+                break
+    
+    # if early_stopping_patience is not None and os.path.exists('best_model.pth'):
+    #     model.load_state_dict(torch.load('best_model.pth'))
+    #     print("\nLoaded best model for final testing.")
 
-                y_true = torch.cat([
-                    torch.ones(pos_scores.size(0), device=pos_scores.device),
-                    torch.zeros(neg_scores.size(0), device=neg_scores.device)
-                ])
-                y_scores = torch.cat([pos_scores, neg_scores])
+    print("\nStarting final testing...")
+    # test_data components moved to device inside evaluate_link_predictor
+    test_metrics = evaluate_link_predictor(model, test_data, train_graph_message_passing_edges_eval, device, desc="Testing", eval_batch_size=eval_batch_size)
+    print(f"\nFinal Test Metrics: ROC AUC: {test_metrics['roc_auc']:.4f}, Avg Precision: {test_metrics['avg_precision']:.4f}, Accuracy: {test_metrics['accuracy']:.4f}")
 
-                all_y_true.append(y_true.cpu())
-                all_y_scores.append(y_scores.cpu())
+    return model, history, test_metrics
 
-    if not all_y_true:
-        raise ValueError("No valid batches for evaluation.")
+def visualize_loss(history, title="Loss Curve", xlabel="Epochs", ylabel="Loss", save_path=None):
+    """
+    Visualize the training loss over epochs.
+    Accepts the 'history' dict returned by run_training_pipeline.
+    If save_path is provided, saves the plot to that file.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_loss'], label='Train Loss', color='blue')
+    if 'val_roc_auc' in history:
+        plt.plot(history['val_roc_auc'], label='Val ROC AUC', color='orange')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.show()
 
-    all_y_true = torch.cat(all_y_true).numpy()
-    all_y_scores = torch.cat(all_y_scores).numpy()
+def plot_training_accuracy_curve(history, title="Training Accuracy Curve", xlabel="Epochs", ylabel="Accuracy", save_path=None):
+    """
+    Plot the training accuracy per epoch.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_acc'], label='Train Accuracy', color='green')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.show()
 
-    roc_auc = roc_auc_score(all_y_true, all_y_scores)
-    precision, recall, _ = precision_recall_curve(all_y_true, all_y_scores)
-    avg_precision = np.trapz(precision, recall)
+def plot_loss_curve(history, title="Loss Curve", xlabel="Epochs", ylabel="Loss", save_path=None):
+    """
+    Plot the training loss per epoch.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_loss'], label='Train Loss', color='blue')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.show()
 
-    return {'roc_auc': roc_auc, 'avg_precision': avg_precision}
+def plot_val_roc_auc_curve(history, title="Validation ROC AUC Curve", xlabel="Epochs", ylabel="ROC AUC", save_path=None):
+    """
+    Plot the validation ROC AUC per epoch.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['val_roc_auc'], label='Val ROC AUC', color='orange')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.show()
 
-def predict_gene_gene_links(model: GraphiStasis, data, threshold=0.5, topk=None):
+def predict_gene_gene_links(model: GraphiStasis, data, node_type_list, idx_to_gene, threshold=0.5, topk=None, device='cpu', save_path=None):
     """
     Predict gene-gene interactions only.
     Returns a list of (gene1_name, gene2_name, score) tuples above the threshold or topk highest.
+    If save_path is provided, saves a histogram of the top scores to that file.
     """
     model.eval()
-    gene_indices = [i for i, t in enumerate(data.node_type_list) if t == 'gene']
-    idx_to_gene = getattr(data, 'idx_to_gene', None)
+    gene_indices = [i for i, t in enumerate(node_type_list) if t == 1]
+    # get all pairs of gene indices
     pairs = list(itertools.combinations(gene_indices, 2))
-    edge_index = torch.tensor(pairs, dtype=torch.long).t().contiguous()
+    if not pairs:
+        return []
+    edge_index = torch.tensor(pairs, dtype=torch.long).t().contiguous().to(device)
 
-    with torch.no_grad():
-        z = model(data.x, data.edge_index)
+    with torch.no_grad(): # no gradient for inference
+        # Move data to device
+        z = model(data.x.to(device), data.edge_index.to(device))
         scores = torch.sigmoid(model.decode(z, edge_index))
 
         # Filter by threshold or topk
         if topk is not None:
+            # Get topk scores
             top_scores, top_idx = torch.topk(scores, topk)
-            selected = [(edge_index[0, i].item(), edge_index[1, i].item(), top_scores[i].item()) for i in top_idx]
+            # Get corresponding edge indices
+            selected = [(edge_index[0, i].item(), edge_index[1, i].item(), top_scores[i].item()) for i in range(topk)]
+            # Convert to numpy for plotting 
+            plot_scores = top_scores.cpu().numpy()
         else:
+            # Filter by threshold
             mask = scores > threshold
+            # Get indices of edges above threshold
             selected = [(edge_index[0, i].item(), edge_index[1, i].item(), scores[i].item()) for i in mask.nonzero(as_tuple=False).flatten()]
+            plot_scores = scores[mask].cpu().numpy()
 
         # Map indices to gene names if available
         if idx_to_gene:
             selected = [(idx_to_gene.get(i, i), idx_to_gene.get(j, j), score) for i, j, score in selected]
 
+        # Optionally save histogram of the predicted scores
+        if save_path and len(plot_scores) > 0:
+            plt.figure()
+            plt.hist(plot_scores, bins=20, color='skyblue')
+            plt.title("Predicted Gene-Gene Link Scores")
+            plt.xlabel("Score")
+            plt.ylabel("Count")
+            plt.grid()
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close()
+
     return selected
 
-def plot_roc_curve_link(y_true, y_scores):
+def plot_roc_curve_link(y_true, y_scores, title='ROC Curve (Link Prediction)', save_path=None):
     """
     Plot the ROC curve for link prediction.
+    If save_path is provided, saves the plot to that file.
     """
     fpr, tpr, _ = roc_curve(y_true, y_scores)
+    plt.figure()
     plt.plot(fpr, tpr, marker='.')
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve (Link Prediction)')
+    plt.title(title)
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
     plt.show()
 
-def plot_precision_recall_link(y_true, y_scores):
+def plot_precision_recall_link(y_true, y_scores, title='Precision-Recall Curve (Link Prediction)', save_path=None):
     """
     Plot the precision-recall curve for link prediction.
+    If save_path is provided, saves the plot to that file.
     """
     precision, recall, _ = precision_recall_curve(y_true, y_scores)
+    plt.figure()
     plt.plot(recall, precision, marker='.')
     plt.xlabel('Recall')
     plt.ylabel('Precision')
-    plt.title('Precision-Recall Curve (Link Prediction)')
+    plt.title(title)
+    plt.grid()
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
     plt.show()

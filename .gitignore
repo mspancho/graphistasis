@@ -3,3 +3,4 @@
 data/
 scripts/__pycache__/
 graphs/
+genept/GenePT_gene_embedding_ada_text.pickle
