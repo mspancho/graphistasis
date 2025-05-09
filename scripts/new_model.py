@@ -165,9 +165,9 @@ class GenePairDataset(Dataset):
     def __init__(self, df, negative_ratio: float=1.0):
         # Unpickle embedding dict file (read-binary mode)
         with open("genept/GenePT_gene_embedding_ada_text.pickle", "rb") as f:
-            gene_embedding_dict = pickle.load(f)
+            self.gene_embedding_dict = pickle.load(f)
 
-        print(f"Make sure your 'input_dim' for MLP is {len(next(iter(gene_embedding_dict.values()))) * 2}") # since you concatenate two embeddings
+        print(f"Make sure your 'input_dim' for MLP is {len(next(iter(self.gene_embedding_dict.values()))) * 2}") # since you concatenate two embeddings
 
         self.data = df
         
@@ -198,7 +198,7 @@ class GenePairDataset(Dataset):
         self.data = pd.concat([self.data, neg_df], ignore_index=True)
 
         # Map gene names to embeddings up front
-        gene_to_embed = {gene: get_genept_embedding(gene, gene_embedding_dict) for gene in all_genes}
+        gene_to_embed = {gene: get_genept_embedding(gene, self.gene_embedding_dict) for gene in all_genes}
 
         # Create embeddings for Gene1 and Gene2
         self.gene1_embeds = np.stack(self.data['Gene1'].map(gene_to_embed))
@@ -209,10 +209,17 @@ class GenePairDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        # Concatenate gene embeddings
-        pair_embed = np.concatenate([self.gene1_embeds[idx], self.gene2_embeds[idx]])
+        row = self.data.iloc[idx]
+        g1 = row['Gene1']
+        g2 = row['Gene2']
+        emb1 = get_genept_embedding(g1, self.gene_embedding_dict)
+        emb2 = get_genept_embedding(g2, self.gene_embedding_dict)
+        pair_embed = np.concatenate([emb1, emb2])
         label = self.labels[idx]
         return torch.tensor(pair_embed, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+        # pair_embed = np.concatenate([self.gene1_embeds[idx], self.gene2_embeds[idx]])
+        # label = self.labels[idx]
+        # return torch.tensor(pair_embed, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
 
 class MLP(nn.Module):
     def __init__(self, input_dim=256, hidden_dim=128):
