@@ -59,6 +59,7 @@ def k_fold_train(dataset, model_class, k=5, epochs=10, batch_size=32, lr=1e-3, i
                 all_preds.extend(preds)
                 all_labels.extend(y.numpy())
 
+        # WE SHOULD MAKE THIS A HIGHER THRESHOLD
         bin_preds = [1 if p >= 0.5 else 0 for p in all_preds]
         metrics = {
             'accuracy': accuracy_score(all_labels, bin_preds),

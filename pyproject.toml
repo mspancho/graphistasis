@@ -9,6 +9,7 @@ dependencies = [
     "geometric>=1.1",
     "ipykernel>=6.29.5",
     "matplotlib>=3.10.1",
+    "matplotlib-venn>=1.1.2",
     "numpy>=2.2.5",
     "pandas>=2.2.3",
     "pip>=25.1.1",
