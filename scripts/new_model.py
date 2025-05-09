@@ -263,3 +263,40 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
     model = MLP(input_dim=256, hidden_dim=128)
     train(model, dataloader, epochs=10, lr=1e-3)
+
+
+def predict_epistatic(model, gene1, gene2, embedding_dict):
+    """
+    Predict whether two genes are epistatic based on their embeddings.
+
+    Args:
+        model (nn.Module): The trained MLP model.
+        gene1 (str): The name of the first gene.
+        gene2 (str): The name of the second gene.
+        embedding_dict (dict): Dictionary containing gene embeddings.
+
+    Returns:
+        float: The predicted probability of the two genes being epistatic.
+    """
+    # Get embeddings for the two genes
+    emb1 = get_genept_embedding(gene1, embedding_dict)
+    emb2 = get_genept_embedding(gene2, embedding_dict)
+
+    # Concatenate the embeddings
+    pair_embed = np.concatenate([emb1, emb2])
+
+    # Convert to tensor
+    pair_embed_tensor = torch.tensor(pair_embed, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
+
+    # Move to device
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    pair_embed_tensor = pair_embed_tensor.to(device)
+
+    # Set model to evaluation mode
+    model.eval()
+
+    # Predict
+    with torch.no_grad():
+        prediction = model(pair_embed_tensor).item()
+
+    return prediction
