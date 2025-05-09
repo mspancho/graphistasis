@@ -209,20 +209,20 @@ class GenePairDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        g1 = row['Gene1']
-        g2 = row['Gene2']
-        emb1 = get_genept_embedding(g1, self.gene_embedding_dict)
-        emb2 = get_genept_embedding(g2, self.gene_embedding_dict)
-        pair_embed = np.concatenate([emb1, emb2])
-        label = self.labels[idx]
-        return torch.tensor(pair_embed, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
-        # pair_embed = np.concatenate([self.gene1_embeds[idx], self.gene2_embeds[idx]])
+        # row = self.data.iloc[idx]
+        # g1 = row['Gene1']
+        # g2 = row['Gene2']
+        # emb1 = get_genept_embedding(g1, self.gene_embedding_dict)
+        # emb2 = get_genept_embedding(g2, self.gene_embedding_dict)
+        # pair_embed = np.concatenate([emb1, emb2])
         # label = self.labels[idx]
         # return torch.tensor(pair_embed, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+        pair_embed = np.concatenate([self.gene1_embeds[idx], self.gene2_embeds[idx]])
+        label = self.labels[idx]
+        return torch.tensor(pair_embed, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
 
 class MLP(nn.Module):
-    def __init__(self, input_dim=256, hidden_dim=128):
+    def __init__(self, input_dim=3072, hidden_dim=256): # Reflects hyperparameter tuning
         super().__init__()
         
         self.ffm = nn.Sequential(
@@ -255,15 +255,64 @@ def train(model, dataloader, epochs=10, lr=1e-3):
             total_loss += loss.item()
         print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
 
-if __name__ == "__main__":
-    # Path to your CSV file with columns: Gene1, Gene2, Label
-    tsv_path = "data/epistatic_interactions.tsv"
-    data_for_prep = get_data_for_dataset(tsv_path=tsv_path)
-    dataset = GenePairDataset(data_for_prep)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-    model = MLP(input_dim=256, hidden_dim=128)
-    train(model, dataloader, epochs=10, lr=1e-3)
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
+from tqdm import tqdm
 
+def train_and_evaluate(model, train_loader, test_loader, epochs, lr, roc_auc_path):
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model.to(device)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Training loop
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        for x, y in pbar:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            preds = model(x)
+            loss = criterion(preds, y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            predicted = (preds >= 0.5).float()
+            correct += (predicted == y).sum().item()
+            total += y.size(0)
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{(correct/total):.4f}"})
+        print(f"Epoch {epoch+1}: Loss={total_loss/len(train_loader):.4f}, Accuracy={correct/total:.4f}")
+
+    # Evaluation on test set
+    model.eval()
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for x, y in tqdm(test_loader, desc="Testing"):
+            x = x.to(device)
+            preds = model(x).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(y.numpy())
+    bin_preds = [1 if p >= 0.5 else 0 for p in all_preds]
+    acc = accuracy_score(all_labels, bin_preds)
+    roc_auc = roc_auc_score(all_labels, all_preds)
+    print(f"Test Accuracy: {acc:.4f}")
+    print(f"Test ROC-AUC: {roc_auc:.4f}")
+
+    # Plot ROC-AUC curve
+    fpr, tpr, _ = roc_curve(all_labels, all_preds)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Test ROC-AUC Curve')
+    plt.legend(loc="lower right")
+    plt.savefig(roc_auc_path)
+    plt.close()
 
 def predict_epistatic(model, gene1, gene2, embedding_dict):
     """
