@@ -171,36 +171,39 @@ class GenePairDataset(Dataset):
 
         self.data = df
         
-        # Collect all unique genes from the dataset
-        all_genes = list(self.data['Gene1'].unique())
+        # NEGATIVE SAMPLING
+        # Build a set of all positive pairs (unordered, so both (g1,g2) and (g2,g1) are covered)
+        positive_pairs = set(tuple(sorted((row['Gene1'], row['Gene2']))) for _, row in self.data.iterrows())
 
-        # Sample negative pairs
+        # all_genes = self.data['Gene1'].cat.categories.tolist()  # Unique genes
+        all_genes = list(pd.unique(self.data['Gene1'].tolist() + self.data['Gene2'].tolist()))
+
+        # Generate negative pairs
         num_negatives = int(self.data.shape[0] * negative_ratio)
-        neg_rows = []
-        while len(neg_rows) < num_negatives:
-            g1, g2 = random.sample(all_genes, 2)
-            match = self.data[(((self.data['Gene1'] == g1) & (self.data['Gene2'] == g2)) | 
-                        ((self.data['Gene1'] == g2) & (self.data['Gene2'] == g1))) & 
-                        (self.data['Label'] == 1)
-                    ]
-            if match.empty:
-                neg_rows.append((g1, g2, 0))
+        neg_pairs = set()
+        attempts = 0
+        max_attempts = num_negatives * 10
 
-        neg_df = pd.DataFrame(neg_rows, columns=['Gene1', 'Gene2', 'Label'])
+        while len(neg_pairs) < num_negatives and attempts < max_attempts:
+            g1, g2 = random.sample(all_genes, 2)
+            pair = tuple(sorted((g1, g2)))
+            if pair not in positive_pairs and pair not in neg_pairs:
+                neg_pairs.add(pair)
+            attempts += 1
+
+        neg_rows = [{'Gene1': g1, 'Gene2': g2, 'Label': 0} for g1, g2 in neg_pairs]
+        neg_df = pd.DataFrame(neg_rows)
+
+        # Concatenate positive and negative samples
         self.data = pd.concat([self.data, neg_df], ignore_index=True)
 
-        self.gene1_embeds = []
-        self.gene2_embeds = []
-        self.labels = []
-        for _, row in self.data.iterrows():
-            g1 = get_genept_embedding(row['Gene1'], gene_embedding_dict)
-            g2 = get_genept_embedding(row['Gene2'], gene_embedding_dict)
-            self.gene1_embeds.append(g1)
-            self.gene2_embeds.append(g2)
-            self.labels.append(row['Label']) # all pairs in epistatic_interactions.tsv are positive 
-        self.gene1_embeds = np.stack(self.gene1_embeds)
-        self.gene2_embeds = np.stack(self.gene2_embeds)
-        self.labels = np.array(self.labels).astype(np.float32)
+        # Map gene names to embeddings up front
+        gene_to_embed = {gene: get_genept_embedding(gene, gene_embedding_dict) for gene in all_genes}
+
+        # Create embeddings for Gene1 and Gene2
+        self.gene1_embeds = np.stack(self.data['Gene1'].map(gene_to_embed))
+        self.gene2_embeds = np.stack(self.data['Gene2'].map(gene_to_embed))
+        self.labels = self.data['Label'].astype(np.float32).values
 
     def __len__(self):
         return len(self.labels)
