@@ -1,4 +1,6 @@
 import torch_geometric as pyg
+import torch_sparse
+import torch_scatter
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 from torch_geometric.explain.algorithm import GNNExplainer
 from torch_geometric.data import Data
