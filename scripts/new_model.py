@@ -228,9 +228,14 @@ class MLP(nn.Module):
         
         self.ffm = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.Dropout(0.5),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Dropout(0.4),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
         )
 

@@ -43,14 +43,29 @@ class GraphiStasis(nn.Module):
             raise ValueError("Invalid conv_type")
 
     def forward(self, x, edge_index):
+        # First GNN layer
         x = self.conv1(x, edge_index)
         x = F.relu(x)
+        x = F.dropout(x, p=0.3, training=self.training) # Prevent overfitting on huge graph 
+        # Second GNN layer
         x = self.conv2(x, edge_index)
+        # Link prediction -> Return node embeddings w/o activation
         return x
 
     def decode(self, z, edge_index):
         # Dot product decoder for link prediction
         return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
+    
+    # TODO: Use a more complex decoder
+    # def decode(self, z, edge_index):
+    #     # Improved decoder: use a bilinear layer for more expressive link prediction
+    #     if not hasattr(self, 'bilinear'):
+    #         # Lazy initialization to match embedding size
+    #         self.bilinear = nn.Bilinear(z.size(1), z.size(1), 1).to(z.device)
+    #     src = z[edge_index[0]]
+    #     dst = z[edge_index[1]]
+    #     out = self.bilinear(src, dst).squeeze(-1)
+    #     return out
 
     def decode_all(self, z):
         # All possible pairs (for full adjacency prediction)
@@ -147,7 +162,9 @@ def compute_binary_accuracy(y_pred_logits, y_true):
     return (y_pred.cpu() == y_true.cpu()).float().mean().item()
 
 def train_one_epoch(model: GraphiStasis,
-                    train_data: Data, # Full training data
+                    train_data: Data, # Full training graph
+                    batch_size: int,
+                    num_neighbors: int,
                     optimizer: optim.Adam,
                     criterion: nn.Module,
                     device: torch.device) -> tuple:
@@ -156,28 +173,66 @@ def train_one_epoch(model: GraphiStasis,
     Returns (loss, accuracy).
     """
     model.train()
-    optimizer.zero_grad()
+    # optimizer.zero_grad()
 
-    # Move data to device
-    # train_data should already be on CPU from prepare_data, RandomLinkSplit
-    x = train_data.x.to(device)
-    edge_index = train_data.edge_index.to(device) # Message-passing edges
-    edge_label_index = train_data.edge_label_index.to(device) # Supervision edges
-    edge_label = train_data.edge_label.to(device) # Supervision labels
+    # # Move data to device
+    # # train_data should already be on CPU from prepare_data, RandomLinkSplit
+    # x = train_data.x.to(device)
+    # edge_index = train_data.edge_index.to(device) # Message-passing edges
+    # edge_label_index = train_data.edge_label_index.to(device) # Supervision edges
+    # edge_label = train_data.edge_label.to(device) # Supervision labels
 
-    # GNN forward pass using all training edges for message passing
-    node_embeddings = model(x, edge_index)
+    # # GNN forward pass using all training edges for message passing
+    # node_embeddings = model(x, edge_index)
 
-    # Decode scores for the supervision links
-    pred_scores = model.decode(node_embeddings, edge_label_index)
+    # # Decode scores for the supervision links
+    # pred_scores = model.decode(node_embeddings, edge_label_index)
     
-    # Compute loss
-    loss = criterion(pred_scores, edge_label)
-    loss.backward()
-    optimizer.step()
+    # # Compute loss
+    # loss = criterion(pred_scores, edge_label)
+    # loss.backward()
+    # optimizer.step()
 
-    acc = compute_binary_accuracy(pred_scores, edge_label)
-    return loss.item(), acc
+    # acc = compute_binary_accuracy(pred_scores, edge_label)
+    # return loss.item(), acc
+
+    # Create the loader for positive and negative edges (supervision links)
+    loader = LinkNeighborLoader(
+        data=train_data,
+        edge_label_index=train_data.edge_label_index,
+        edge_label=train_data.edge_label,
+        batch_size=batch_size,
+        shuffle=True,
+        num_neighbors=[num_neighbors, num_neighbors],
+        neg_sampling_ratio=0.0,  # Already have negative edges from RandomLinkSplit
+        drop_last=False
+    )
+
+    total_loss = 0.0
+    total_acc = 0.0
+    num_batches = 0
+
+    for batch in loader:
+        optimizer.zero_grad()
+        x = batch.x.to(device)
+        edge_index = batch.edge_index.to(device)
+        edge_label_index = batch.edge_label_index.to(device)
+        edge_label = batch.edge_label.to(device)
+
+        node_embeddings = model(x, edge_index)
+        pred_scores = model.decode(node_embeddings, edge_label_index)
+        loss = criterion(pred_scores, edge_label)
+        loss.backward()
+        optimizer.step()
+
+        acc = compute_binary_accuracy(pred_scores, edge_label)
+        total_loss += loss.item()
+        total_acc += acc
+        num_batches += 1
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_acc = total_acc / num_batches if num_batches > 0 else 0.0
+    return avg_loss, avg_acc
 
 
 @torch.no_grad()
@@ -186,7 +241,8 @@ def evaluate_link_predictor(model: GraphiStasis,
                             train_graph_edge_index: torch.Tensor, 
                             device: torch.device,
                             desc: str = "Evaluating", # Description for tqdm
-                            eval_batch_size: int = 2048 # Batch size for evaluating links
+                            eval_batch_size: int = 2048, # Batch size for evaluating links,
+                            num_neighbors: int = 10 # Number of neighbors for NeighborLoader
                             ) -> dict:
     """
     Evaluates the model on a given data split (validation or test).
@@ -196,34 +252,96 @@ def evaluate_link_predictor(model: GraphiStasis,
     """
     model.eval()
 
-    # Generate embeddings for ALL nodes using the full feature set (data_split.x)
-    # and the message passing edges from the TRAINING graph
-    all_node_embeddings = model(data_split.x.to(device), train_graph_edge_index.to(device))
+    # # Generate embeddings for ALL nodes using the full feature set (data_split.x)
+    # # and the message passing edges from the TRAINING graph
+    # all_node_embeddings = model(data_split.x.to(device), train_graph_edge_index.to(device))
 
-    # Decode scores for the supervision links in the current data_split
-    # data_split.edge_label_index contains (+) and (-) links to evaluate
+    # # Decode scores for the supervision links in the current data_split
+    # # data_split.edge_label_index contains (+) and (-) links to evaluate
     
+    # y_scores_list = []
+    # y_true_list = []
+    # y_logits_list = []
+
+    # num_links_to_eval = data_split.edge_label_index.shape[1]
+    
+    # # Iterate over edge_label_index in chunks for progress bar
+    # for i in tqdm.tqdm(range(0, num_links_to_eval, eval_batch_size), desc=desc, leave=False):
+    #     batch_edge_label_index = data_split.edge_label_index[:, i:i+eval_batch_size].to(device)
+    #     batch_edge_label = data_split.edge_label[i:i+eval_batch_size] # Corresponding labels
+
+    #     # Skip empty batches
+    #     if batch_edge_label_index.shape[1] == 0:
+    #         continue
+
+    #     # Decode scores for the current batch of links
+    #     batch_pred_scores_logits = model.decode(all_node_embeddings, batch_edge_label_index)
+    #     batch_pred_scores_sigmoid = torch.sigmoid(batch_pred_scores_logits)
+        
+    #     y_scores_list.append(batch_pred_scores_sigmoid.cpu())
+    #     y_true_list.append(batch_edge_label.cpu())
+    #     y_logits_list.append(batch_pred_scores_logits.cpu())
+
+    # if not y_true_list: # No links were evaluated
+    #     print(f"Warning: No links evaluated in {desc}. Returning default metrics.")
+    #     return {'roc_auc': 0.0, 'avg_precision': 0.0, 'accuracy': 0.0, 'y_true': [], 'y_scores': []}
+
+    # # Concatenate all batches
+    # true_labels = torch.cat(y_true_list).numpy()
+    # pred_scores_np = torch.cat(y_scores_list).numpy()
+    # pred_logits = torch.cat(y_logits_list)
+    # acc = compute_binary_accuracy(pred_logits, torch.cat(y_true_list))
+
+    # # Check if true_labels contains only one class
+    # if len(np.unique(true_labels)) < 2:
+    #     roc_auc = 0.5 
+    #     avg_precision = np.mean(true_labels) if len(true_labels) > 0 else 0.0
+    #     print(f"Warning: Evaluation data in '{desc}' contains only one class ({np.unique(true_labels)}). Metrics might be misleading.")
+    # else: # Normal eval
+    #     roc_auc = roc_auc_score(true_labels, pred_scores_np)
+    #     precision, recall, _ = precision_recall_curve(true_labels, pred_scores_np)
+    #     avg_precision = np.trapezoid(recall, precision) if len(recall) > 1 and len(precision) > 1 else 0.0
+    #     if not np.isfinite(avg_precision): avg_precision = 0.0
+
+    # return {
+    #     'roc_auc': roc_auc,
+    #     'avg_precision': avg_precision,
+    #     'accuracy': acc,
+    #     'y_true': true_labels,
+    #     'y_scores': pred_scores_np
+    # }
+
+
+    ##########################################################################
+
+    # Use LinkNeighborLoader for evaluation batching
+    loader = LinkNeighborLoader(
+        data=data_split,
+        edge_label_index=data_split.edge_label_index,
+        edge_label=data_split.edge_label,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        num_neighbors=[num_neighbors, num_neighbors],
+        neg_sampling_ratio=0.0,  # Already have negatives from RandomLinkSplit
+        drop_last=False
+    )
+
     y_scores_list = []
     y_true_list = []
     y_logits_list = []
 
-    num_links_to_eval = data_split.edge_label_index.shape[1]
-    
-    # Iterate over edge_label_index in chunks for progress bar
-    for i in tqdm.tqdm(range(0, num_links_to_eval, eval_batch_size), desc=desc, leave=False):
-        batch_edge_label_index = data_split.edge_label_index[:, i:i+eval_batch_size].to(device)
-        batch_edge_label = data_split.edge_label[i:i+eval_batch_size] # Corresponding labels
+    for batch in tqdm.tqdm(loader, desc=desc, leave=False):
+        x = batch.x.to(device)
+        edge_index = batch.edge_index.to(device)
+        edge_label_index = batch.edge_label_index.to(device)
+        edge_label = batch.edge_label.to(device)
 
-        # Skip empty batches
-        if batch_edge_label_index.shape[1] == 0:
-            continue
-
-        # Decode scores for the current batch of links
-        batch_pred_scores_logits = model.decode(all_node_embeddings, batch_edge_label_index)
+        node_embeddings = model(x, edge_index)
+        batch_pred_scores_logits = model.decode(node_embeddings, edge_label_index)
         batch_pred_scores_sigmoid = torch.sigmoid(batch_pred_scores_logits)
-        
+
         y_scores_list.append(batch_pred_scores_sigmoid.cpu())
-        y_true_list.append(batch_edge_label.cpu())
+        y_true_list.append(edge_label.cpu())
         y_logits_list.append(batch_pred_scores_logits.cpu())
 
     if not y_true_list: # No links were evaluated
@@ -244,7 +362,7 @@ def evaluate_link_predictor(model: GraphiStasis,
     else: # Normal eval
         roc_auc = roc_auc_score(true_labels, pred_scores_np)
         precision, recall, _ = precision_recall_curve(true_labels, pred_scores_np)
-        avg_precision = np.trapz(recall, precision) if len(recall) > 1 and len(precision) > 1 else 0.0
+        avg_precision = np.trapezoid(recall, precision) if len(recall) > 1 and len(precision) > 1 else 0.0
         if not np.isfinite(avg_precision): avg_precision = 0.0
 
     return {
@@ -265,13 +383,15 @@ def run_training_pipeline(
     epochs: int = 50,
     learning_rate: float = 0.01,
     early_stopping_patience: int = 10, # Set to None to disable
+    train_batch_size: int = 2048, # Batch size for train_one_epoch
+    num_neighbors: int = 10, # Number of neighbors for NeighborLoader
     eval_batch_size: int = 2048 # Batch size for evaluate_link_predictor
     ) -> tuple:
     """
     Main pipeline to train, validate, and test the GNN link predictor using full-graph training.
     """
     # device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    device = torch.device('cpu')
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # Ensure model input dims match the data
@@ -308,12 +428,15 @@ def run_training_pipeline(
     for epoch in tqdm.tqdm(range(1, epochs + 1), desc="Overall Epochs"):
         # Pass the full train_data to train_one_epoch
         # train_data moved to device inside train_one_epoch
-        avg_train_loss, avg_train_acc = train_one_epoch(model, train_data, optimizer, criterion, device)
+        avg_train_loss, avg_train_acc = train_one_epoch(model, train_data, train_batch_size, num_neighbors, optimizer, criterion, device)
         history['train_loss'].append(avg_train_loss)
         history['train_acc'].append(avg_train_acc)
         
         # val_data components moved to device inside evaluate_link_predictor
-        val_metrics = evaluate_link_predictor(model, val_data, train_graph_message_passing_edges_eval, device, desc="Validating", eval_batch_size=eval_batch_size)
+        val_metrics = evaluate_link_predictor(
+            model, val_data, train_graph_message_passing_edges_eval, device,
+            desc="Validating", eval_batch_size=eval_batch_size, num_neighbors=num_neighbors
+        )
         history['val_roc_auc'].append(val_metrics['roc_auc'])
         history['val_avg_precision'].append(val_metrics['avg_precision'])
         history['val_acc'].append(val_metrics['accuracy'])
@@ -342,7 +465,10 @@ def run_training_pipeline(
 
     print("\nStarting final testing...")
     # test_data components moved to device inside evaluate_link_predictor
-    test_metrics = evaluate_link_predictor(model, test_data, train_graph_message_passing_edges_eval, device, desc="Testing", eval_batch_size=eval_batch_size)
+    test_metrics = evaluate_link_predictor(
+        model, test_data, train_graph_message_passing_edges_eval, device,
+        desc="Testing", eval_batch_size=eval_batch_size, num_neighbors=num_neighbors
+    )
     print(f"\nFinal Test Metrics: ROC AUC: {test_metrics['roc_auc']:.4f}, Avg Precision: {test_metrics['avg_precision']:.4f}, Accuracy: {test_metrics['accuracy']:.4f}")
 
     return model, history, test_metrics
