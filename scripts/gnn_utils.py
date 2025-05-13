@@ -1,6 +1,7 @@
 import torch_geometric as pyg
 import torch_sparse
 import torch_scatter
+from torch_geometric.typing import SparseTensor
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 from torch_geometric.explain.algorithm import GNNExplainer
 from torch_geometric.data import Data
@@ -48,32 +49,32 @@ class GraphiStasis(nn.Module):
         # First GNN layer
         x = self.conv1(x, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=0.3, training=self.training) # Prevent overfitting on huge graph 
+        x = F.dropout(x, p=0.3, training=self.training) # Prevent overfitting on huge graph
         # Second GNN layer
         x = self.conv2(x, edge_index)
         # Link prediction -> Return node embeddings w/o activation
         return x
 
-    def decode(self, z, edge_index):
-        # Dot product decoder for link prediction
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
-    
-    # TODO: Use a more complex decoder
     # def decode(self, z, edge_index):
-    #     # Improved decoder: use a bilinear layer for more expressive link prediction
-    #     if not hasattr(self, 'bilinear'):
-    #         # Lazy initialization to match embedding size
-    #         self.bilinear = nn.Bilinear(z.size(1), z.size(1), 1).to(z.device)
-    #     src = z[edge_index[0]]
-    #     dst = z[edge_index[1]]
-    #     out = self.bilinear(src, dst).squeeze(-1)
-    #     return out
+    #     # Dot product decoder for link prediction
+    #     return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
+
+    # TODO: Use a more complex decoder
+    def decode(self, z, edge_index):
+        # Improved decoder: use a bilinear layer for more expressive link prediction
+        if not hasattr(self, 'bilinear'):
+            # Lazy initialization to match embedding size
+            self.bilinear = nn.Bilinear(z.size(1), z.size(1), 1).to(z.device)
+        src = z[edge_index[0]]
+        dst = z[edge_index[1]]
+        out = self.bilinear(src, dst).squeeze(-1)
+        return out
 
     def decode_all(self, z):
         # All possible pairs (for full adjacency prediction)
         prob_adj = torch.sigmoid(torch.matmul(z, z.t()))
         return prob_adj
-    
+
     def explain_link(self, data, edge, epochs=200, visualize=True):
         """
         Use GNNExplainer to interpret the prediction for a specific edge (link) between two nodes.
@@ -91,6 +92,15 @@ class GraphiStasis(nn.Module):
         if visualize: # Visualize the explanation
             explainer.visualize_subgraph(edge, data.edge_index, edge_mask, y=None, threshold=None)
         return edge_mask, node_feat_mask
+
+    def save(self, model_dir="models", model_name="graphistasis.pt"):
+        """
+        Save the model state_dict to the specified directory.
+        """
+        os.makedirs(model_dir, exist_ok=True)
+        save_path = os.path.join(model_dir, model_name)
+        torch.save(self.state_dict(), save_path)
+        print(f"Model saved to {save_path}")
 
 def prepare_data(graph: nx.Graph) -> Data:
     """
@@ -174,6 +184,7 @@ def train_one_epoch(model: GraphiStasis,
     Trains the model for one epoch on the full training graph.
     Returns (loss, accuracy).
     """
+    import torch_sparse
     model.train()
     # optimizer.zero_grad()
 
@@ -189,7 +200,7 @@ def train_one_epoch(model: GraphiStasis,
 
     # # Decode scores for the supervision links
     # pred_scores = model.decode(node_embeddings, edge_label_index)
-    
+
     # # Compute loss
     # loss = criterion(pred_scores, edge_label)
     # loss.backward()
@@ -238,9 +249,9 @@ def train_one_epoch(model: GraphiStasis,
 
 
 @torch.no_grad()
-def evaluate_link_predictor(model: GraphiStasis, 
-                            data_split: Data, 
-                            train_graph_edge_index: torch.Tensor, 
+def evaluate_link_predictor(model: GraphiStasis,
+                            data_split: Data,
+                            train_graph_edge_index: torch.Tensor,
                             device: torch.device,
                             desc: str = "Evaluating", # Description for tqdm
                             eval_batch_size: int = 2048, # Batch size for evaluating links,
@@ -253,6 +264,7 @@ def evaluate_link_predictor(model: GraphiStasis,
     Returns dict with ROC AUC, avg precision, accuracy, y_true, y_scores.
     """
     model.eval()
+    import torch_sparse
 
     # # Generate embeddings for ALL nodes using the full feature set (data_split.x)
     # # and the message passing edges from the TRAINING graph
@@ -260,13 +272,13 @@ def evaluate_link_predictor(model: GraphiStasis,
 
     # # Decode scores for the supervision links in the current data_split
     # # data_split.edge_label_index contains (+) and (-) links to evaluate
-    
+
     # y_scores_list = []
     # y_true_list = []
     # y_logits_list = []
 
     # num_links_to_eval = data_split.edge_label_index.shape[1]
-    
+
     # # Iterate over edge_label_index in chunks for progress bar
     # for i in tqdm.tqdm(range(0, num_links_to_eval, eval_batch_size), desc=desc, leave=False):
     #     batch_edge_label_index = data_split.edge_label_index[:, i:i+eval_batch_size].to(device)
@@ -279,7 +291,7 @@ def evaluate_link_predictor(model: GraphiStasis,
     #     # Decode scores for the current batch of links
     #     batch_pred_scores_logits = model.decode(all_node_embeddings, batch_edge_label_index)
     #     batch_pred_scores_sigmoid = torch.sigmoid(batch_pred_scores_logits)
-        
+
     #     y_scores_list.append(batch_pred_scores_sigmoid.cpu())
     #     y_true_list.append(batch_edge_label.cpu())
     #     y_logits_list.append(batch_pred_scores_logits.cpu())
@@ -296,7 +308,7 @@ def evaluate_link_predictor(model: GraphiStasis,
 
     # # Check if true_labels contains only one class
     # if len(np.unique(true_labels)) < 2:
-    #     roc_auc = 0.5 
+    #     roc_auc = 0.5
     #     avg_precision = np.mean(true_labels) if len(true_labels) > 0 else 0.0
     #     print(f"Warning: Evaluation data in '{desc}' contains only one class ({np.unique(true_labels)}). Metrics might be misleading.")
     # else: # Normal eval
@@ -358,7 +370,7 @@ def evaluate_link_predictor(model: GraphiStasis,
 
     # Check if true_labels contains only one class
     if len(np.unique(true_labels)) < 2:
-        roc_auc = 0.5 
+        roc_auc = 0.5
         avg_precision = np.mean(true_labels) if len(true_labels) > 0 else 0.0
         print(f"Warning: Evaluation data in '{desc}' contains only one class ({np.unique(true_labels)}). Metrics might be misleading.")
     else: # Normal eval
@@ -395,6 +407,7 @@ def run_training_pipeline(
     # device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    import torch_sparse
 
     # Ensure model input dims match the data
     if 'in_channels' not in model_args and hasattr(train_data, 'num_node_features'):
@@ -408,7 +421,7 @@ def run_training_pipeline(
     # Initialize model, optimizer, and loss fn
     model = model_class(**model_args).to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.BCEWithLogitsLoss() 
+    criterion = nn.BCEWithLogitsLoss()
 
     # Initialize early stopping variables
     best_val_metric = 0.0
@@ -433,7 +446,7 @@ def run_training_pipeline(
         avg_train_loss, avg_train_acc = train_one_epoch(model, train_data, train_batch_size, num_neighbors, optimizer, criterion, device)
         history['train_loss'].append(avg_train_loss)
         history['train_acc'].append(avg_train_acc)
-        
+
         # val_data components moved to device inside evaluate_link_predictor
         val_metrics = evaluate_link_predictor(
             model, val_data, train_graph_message_passing_edges_eval, device,
@@ -448,19 +461,18 @@ def run_training_pipeline(
               f"Val ROC AUC: {val_metrics['roc_auc']:.4f}, Val Avg Precision: {val_metrics['avg_precision']:.4f}, Val Acc: {val_metrics['accuracy']:.4f}")
 
         # Early stopping check
-        current_val_metric = val_metrics['roc_auc'] 
+        current_val_metric = val_metrics['roc_auc']
         if early_stopping_patience is not None:
             if current_val_metric > best_val_metric:
                 best_val_metric = current_val_metric
                 epochs_no_improve = 0
-                # torch.save(model.state_dict(), 'best_model.pth')
             else:
                 epochs_no_improve += 1
-            
+
             if epochs_no_improve >= early_stopping_patience:
                 print(f"\nEarly stopping triggered after {early_stopping_patience} epochs with no improvement.")
                 break
-    
+
     # if early_stopping_patience is not None and os.path.exists('best_model.pth'):
     #     model.load_state_dict(torch.load('best_model.pth'))
     #     print("\nLoaded best model for final testing.")
@@ -472,6 +484,9 @@ def run_training_pipeline(
         desc="Testing", eval_batch_size=eval_batch_size, num_neighbors=num_neighbors
     )
     print(f"\nFinal Test Metrics: ROC AUC: {test_metrics['roc_auc']:.4f}, Avg Precision: {test_metrics['avg_precision']:.4f}, Accuracy: {test_metrics['accuracy']:.4f}")
+
+    # Save the trained model
+    model.save(model_dir="models", model_name=f"{model_args['conv_type']}.pt")
 
     return model, history, test_metrics
 
@@ -539,7 +554,14 @@ def plot_val_roc_auc_curve(history, title="Validation ROC AUC Curve", xlabel="Ep
         plt.savefig(save_path, bbox_inches='tight')
     plt.show()
 
-def predict_gene_gene_links(model: GraphiStasis, data, node_type_list, idx_to_gene, threshold=0.5, topk=None, device='cpu', save_path=None):
+def predict_gene_gene_links(model: GraphiStasis,
+                            data,
+                            node_type_list,
+                            idx_to_gene,
+                            threshold=0.5,
+                            topk=None,
+                            device=torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'),
+                            save_path=None):
     """
     Predict gene-gene interactions only.
     Returns a list of (gene1_name, gene2_name, score) tuples above the threshold or topk highest.
@@ -564,14 +586,14 @@ def predict_gene_gene_links(model: GraphiStasis, data, node_type_list, idx_to_ge
             top_scores, top_idx = torch.topk(scores, topk)
             # Get corresponding edge indices
             selected = [(edge_index[0, i].item(), edge_index[1, i].item(), top_scores[i].item()) for i in range(topk)]
-            # Convert to numpy for plotting 
+            # Convert to numpy for plotting
             plot_scores = top_scores.cpu().numpy()
         else:
             # Filter by threshold
             mask = scores > threshold
             # Get indices of edges above threshold
             selected = [(edge_index[0, i].item(), edge_index[1, i].item(), scores[i].item()) for i in mask.nonzero(as_tuple=False).flatten()]
-            plot_scores = scores[mask].cpu().numpy()
+            plot_scores = scores[mask].numpy()
 
         # Map indices to gene names if available
         if idx_to_gene:
