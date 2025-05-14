@@ -127,7 +127,7 @@ def fetch_epistatic_interactions(gene_list, access_key, tax_id=9606, batch_size=
 
     # Initialize tqdm progress bar
     total_batches = (len(gene_list) + batch_size - 1) // batch_size  # Calculate total number of batches
-    for batch in tqdm(batch_gene_list(gene_list, batch_size), total=total_batches, desc="Processing Batches") as pbar:
+    for batch in tqdm(batch_gene_list(gene_list, batch_size), total=total_batches, desc="Processing Batches"):
         params = {
             "geneList": "|".join(batch),  # Join genes in the batch with '|'
             "searchNames": "true",
