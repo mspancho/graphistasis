@@ -45,6 +45,7 @@ class GraphiStasis(nn.Module):
             self.conv2 = SAGEConv(hidden_channels, out_channels)
         else:
             raise ValueError("Invalid conv_type")
+        self.bilinear = nn.Bilinear(out_channels, out_channels, 1)
 
     def forward(self, x, edge_index):
         # First GNN layer
@@ -63,9 +64,9 @@ class GraphiStasis(nn.Module):
     # TODO: Use a more complex decoder
     def decode(self, z, edge_index):
         # Improved decoder: use a bilinear layer for more expressive link prediction
-        if not hasattr(self, 'bilinear'):
-            # Lazy initialization to match embedding size
-            self.bilinear = nn.Bilinear(z.size(1), z.size(1), 1).to(z.device)
+        # if not hasattr(self, 'bilinear'):
+        #     # lazy init for testing to match embedding size
+        #     self.bilinear = nn.Bilinear(z.size(1), z.size(1), 1).to(z.device)
         src = z[edge_index[0]]
         dst = z[edge_index[1]]
         out = self.bilinear(src, dst).squeeze(-1)
@@ -594,7 +595,7 @@ def predict_gene_gene_links(model: GraphiStasis,
             mask = scores > threshold
             # Get indices of edges above threshold
             selected = [(edge_index[0, i].item(), edge_index[1, i].item(), scores[i].item()) for i in mask.nonzero(as_tuple=False).flatten()]
-            plot_scores = scores[mask].numpy()
+            plot_scores = scores[mask].cpu().numpy()
 
         # Map indices to gene names if available
         if idx_to_gene:
