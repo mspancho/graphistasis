@@ -117,6 +117,9 @@ def fetch_epistatic_interactions(gene_list, access_key, tax_id=9606, batch_size=
     base_url = "https://webservice.thebiogrid.org/interactions/"
     all_interactions = {}
 
+    bad_batch = []
+    bad_batch_count = 0
+
     # Function to batch the gene list
     def batch_gene_list(gene_list, batch_size):
         for i in range(0, len(gene_list), batch_size):
@@ -124,7 +127,7 @@ def fetch_epistatic_interactions(gene_list, access_key, tax_id=9606, batch_size=
 
     # Initialize tqdm progress bar
     total_batches = (len(gene_list) + batch_size - 1) // batch_size  # Calculate total number of batches
-    for batch in tqdm(batch_gene_list(gene_list, batch_size), total=total_batches, desc="Processing Batches"):
+    for batch in tqdm(batch_gene_list(gene_list, batch_size), total=total_batches, desc="Processing Batches") as pbar:
         params = {
             "geneList": "|".join(batch),  # Join genes in the batch with '|'
             "searchNames": "true",
@@ -146,7 +149,9 @@ def fetch_epistatic_interactions(gene_list, access_key, tax_id=9606, batch_size=
 
             # Ensure the response is a dictionary
             if not isinstance(interactions, dict):
-                print(f"Unexpected response format for batch {batch}: {interactions}")
+                # print(f"Some genes not found in batch: {batch}", end="\r")
+                bad_batch.append(batch)
+                bad_batch_count += 1
                 continue  # Skip this batch and move to the next one
 
             # Parse the interactions
@@ -176,7 +181,9 @@ def fetch_epistatic_interactions(gene_list, access_key, tax_id=9606, batch_size=
     # Filter the dictionary to only include the genes in the input list
     filtered_interactions = {gene: all_interactions.get(gene, []) for gene in gene_list}
 
-    return filtered_interactions
+    print(f"Number of batches with errors: {bad_batch_count}")
+
+    return filtered_interactions, bad_batch
 
 Entrez.email = "tasawwar_rahman@brown.edu"  # Replace with your email
 Entrez.api_key = "b512b74d9e6a81b2ae8c21068512ecfb2308"

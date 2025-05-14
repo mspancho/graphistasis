@@ -1,6 +1,6 @@
 import torch_geometric as pyg
-import torch_sparse
-import torch_scatter
+# import torch_sparse
+# import torch_scatter
 from torch_geometric.typing import SparseTensor
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 from torch_geometric.explain.algorithm import GNNExplainer
@@ -26,6 +26,7 @@ import networkx as nx
 import tqdm
 import itertools
 import pickle
+import os
 
 class GraphiStasis(nn.Module):
     """
