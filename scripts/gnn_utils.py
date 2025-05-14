@@ -188,28 +188,6 @@ def train_one_epoch(model: GraphiStasis,
     """
     import torch_sparse
     model.train()
-    # optimizer.zero_grad()
-
-    # # Move data to device
-    # # train_data should already be on CPU from prepare_data, RandomLinkSplit
-    # x = train_data.x.to(device)
-    # edge_index = train_data.edge_index.to(device) # Message-passing edges
-    # edge_label_index = train_data.edge_label_index.to(device) # Supervision edges
-    # edge_label = train_data.edge_label.to(device) # Supervision labels
-
-    # # GNN forward pass using all training edges for message passing
-    # node_embeddings = model(x, edge_index)
-
-    # # Decode scores for the supervision links
-    # pred_scores = model.decode(node_embeddings, edge_label_index)
-
-    # # Compute loss
-    # loss = criterion(pred_scores, edge_label)
-    # loss.backward()
-    # optimizer.step()
-
-    # acc = compute_binary_accuracy(pred_scores, edge_label)
-    # return loss.item(), acc
 
     # Create the loader for positive and negative edges (supervision links)
     loader = LinkNeighborLoader(
@@ -266,69 +244,6 @@ def evaluate_link_predictor(model: GraphiStasis,
     Returns dict with ROC AUC, avg precision, accuracy, y_true, y_scores.
     """
     model.eval()
-    import torch_sparse
-
-    # # Generate embeddings for ALL nodes using the full feature set (data_split.x)
-    # # and the message passing edges from the TRAINING graph
-    # all_node_embeddings = model(data_split.x.to(device), train_graph_edge_index.to(device))
-
-    # # Decode scores for the supervision links in the current data_split
-    # # data_split.edge_label_index contains (+) and (-) links to evaluate
-
-    # y_scores_list = []
-    # y_true_list = []
-    # y_logits_list = []
-
-    # num_links_to_eval = data_split.edge_label_index.shape[1]
-
-    # # Iterate over edge_label_index in chunks for progress bar
-    # for i in tqdm.tqdm(range(0, num_links_to_eval, eval_batch_size), desc=desc, leave=False):
-    #     batch_edge_label_index = data_split.edge_label_index[:, i:i+eval_batch_size].to(device)
-    #     batch_edge_label = data_split.edge_label[i:i+eval_batch_size] # Corresponding labels
-
-    #     # Skip empty batches
-    #     if batch_edge_label_index.shape[1] == 0:
-    #         continue
-
-    #     # Decode scores for the current batch of links
-    #     batch_pred_scores_logits = model.decode(all_node_embeddings, batch_edge_label_index)
-    #     batch_pred_scores_sigmoid = torch.sigmoid(batch_pred_scores_logits)
-
-    #     y_scores_list.append(batch_pred_scores_sigmoid.cpu())
-    #     y_true_list.append(batch_edge_label.cpu())
-    #     y_logits_list.append(batch_pred_scores_logits.cpu())
-
-    # if not y_true_list: # No links were evaluated
-    #     print(f"Warning: No links evaluated in {desc}. Returning default metrics.")
-    #     return {'roc_auc': 0.0, 'avg_precision': 0.0, 'accuracy': 0.0, 'y_true': [], 'y_scores': []}
-
-    # # Concatenate all batches
-    # true_labels = torch.cat(y_true_list).numpy()
-    # pred_scores_np = torch.cat(y_scores_list).numpy()
-    # pred_logits = torch.cat(y_logits_list)
-    # acc = compute_binary_accuracy(pred_logits, torch.cat(y_true_list))
-
-    # # Check if true_labels contains only one class
-    # if len(np.unique(true_labels)) < 2:
-    #     roc_auc = 0.5
-    #     avg_precision = np.mean(true_labels) if len(true_labels) > 0 else 0.0
-    #     print(f"Warning: Evaluation data in '{desc}' contains only one class ({np.unique(true_labels)}). Metrics might be misleading.")
-    # else: # Normal eval
-    #     roc_auc = roc_auc_score(true_labels, pred_scores_np)
-    #     precision, recall, _ = precision_recall_curve(true_labels, pred_scores_np)
-    #     avg_precision = np.trapezoid(recall, precision) if len(recall) > 1 and len(precision) > 1 else 0.0
-    #     if not np.isfinite(avg_precision): avg_precision = 0.0
-
-    # return {
-    #     'roc_auc': roc_auc,
-    #     'avg_precision': avg_precision,
-    #     'accuracy': acc,
-    #     'y_true': true_labels,
-    #     'y_scores': pred_scores_np
-    # }
-
-
-    ##########################################################################
 
     # Use LinkNeighborLoader for evaluation batching
     loader = LinkNeighborLoader(
@@ -415,7 +330,6 @@ def run_training_pipeline(
     if 'in_channels' not in model_args and hasattr(train_data, 'num_node_features'):
         model_args['in_channels'] = train_data.num_node_features
     elif 'in_channels' not in model_args:
-        # If using other features (e.g. GenePT), this needs to be accurate
         num_features = train_data.x.shape[1] if train_data.x is not None and train_data.x.dim() > 1 else 1
         print(f"Warning: 'in_channels' not specified in model_args. Setting to {num_features} based on train_data.x.shape.")
         model_args['in_channels'] = num_features
@@ -438,7 +352,6 @@ def run_training_pipeline(
 
     # edge_index for message passing during eval should be from training graph
     # train_data.edge_index as returned by RandomLinkSplit
-    # check correct device for evaluate_link_predictor
     train_graph_message_passing_edges_eval = train_data.edge_index # moved to device in evaluate_link_predictor
 
     # Main epoch loop with overall progress bar
